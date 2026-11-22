@@ -1,0 +1,21 @@
+[Unit]
+Description=Vault sync: encrypted blobs for the Vault app (set VAULT_SYNC_BIND to your Tailscale or LAN address, port 8803)
+After=network-online.target tailscaled.service
+OnFailure=notify-failure@%n.service
+
+[Service]
+User=vaultsync
+Group=vaultsync
+Environment=VAULT_SYNC_DIR=/var/lib/vault-sync VAULT_SYNC_BIND=127.0.0.1 VAULT_SYNC_PORT=8803
+ExecStart=/usr/bin/python3 -B /opt/vault-sync/server.py
+Restart=always
+RestartSec=5
+MemoryMax=300M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vault-sync
+
+[Install]
+WantedBy=multi-user.target

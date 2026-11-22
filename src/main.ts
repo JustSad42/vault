@@ -1,187 +1,36 @@
-import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { save } from '@tauri-apps/plugin-dialog';
 import './style.css';
+import './updater';
+import {
+  Audit, CATEGORY_COLORS, DOC_TYPES, F, Field, FKind, Item, KIND_ORDER, KINDS, Kind, Live, Ref, Settings, Sum, TEMPLATES, Template, ago, applyTheme, avatar, call, chip, copyBtn, copyText, dialog,
+  err, flashIcon, fromHtml, h, hooks, hue, icon, iconBtn, isImage, meter, put, pwField, S, toast,
+} from './kit';
+import {
+  ask, attachFiles, attachmentTile, confirmDialog, forgotDialog, genDialog, restoreDialog, masterDialog, newDialog, photoDialog, saveSettings, searchHelp, settingsDialog, shareDialog, twofaDialog, versionsDialog,
+} from './dialogs';
+import { Block, Inl, parse as parseMd, toggleLine } from './md';
 
-type Kind = 'login' | 'card' | 'note' | 'ssh' | 'api' | 'wifi' | 'other';
-type FKind = 'text' | 'secret' | 'multiline' | 'totp';
-interface Field { label: string; value: string; kind: FKind }
-interface Hist { label: string; value: string; at: number }
-interface Item { id: string; kind: Kind; title: string; folder: string; fields: Field[]; notes: string; favorite: boolean; updated: number; history: Hist[]; deleted: number }
-interface Sum { id: string; kind: Kind; title: string; sub: string; folder: string; favorite: boolean; deleted: boolean }
-interface Settings { autolock_min: number; clip_secs: number }
-interface Ref { id: string; title: string; note: string }
-interface Acct { title: string; account: string; uri: string }
-interface Parsed { accounts: Acct[]; skipped: number }
-interface Live { id: string; title: string; sub: string; label: string; code: string; left: number; period: number }
-interface Audit { total: number; score: number; weak: Ref[]; reused: Ref[]; old: Ref[]; insecure: Ref[] }
-
-const KINDS: Record<Kind, { label: string; plural: string; icon: string; desc: string }> = {
-  login: { label: 'Login', plural: 'Logins', icon: 'key', desc: 'Website or app account' },
-  card: { label: 'Credit / debit card', plural: 'Cards', icon: 'card', desc: 'Payment card' },
-  note: { label: 'Secure note', plural: 'Notes', icon: 'note', desc: 'Private text' },
-  ssh: { label: 'SSH key', plural: 'SSH keys', icon: 'terminal', desc: 'Server access key' },
-  api: { label: 'API key', plural: 'API keys', icon: 'braces', desc: 'Token or secret' },
-  wifi: { label: 'Wi-Fi network', plural: 'Wi-Fi', icon: 'wifi', desc: 'Password with QR code' },
-  other: { label: 'Other card or ID', plural: 'Other', icon: 'id', desc: 'Membership, ID, licence' },
-};
-const KIND_ORDER = Object.keys(KINDS) as Kind[];
-const F = (label: string, kind: FKind = 'text', value = ''): Field => ({ label, value, kind });
-const TEMPLATES: Record<Kind, () => Field[]> = {
-  login: () => [F('Username'), F('Password', 'secret'), F('Website'), F('One-time code', 'totp')],
-  card: () => [F('Cardholder'), F('Card number', 'secret'), F('Expiry'), F('CVV', 'secret'), F('PIN', 'secret')],
-  note: () => [],
-  ssh: () => [F('Public key'), F('Private key', 'multiline'), F('Passphrase', 'secret')],
-  api: () => [F('Key', 'secret'), F('Endpoint'), F('Expires')],
-  wifi: () => [F('Network name'), F('Password', 'secret'), F('Security', 'text', 'WPA2')],
-  other: () => [F('Name'), F('Number')],
-};
-
-const ICONS: Record<string, string> = {
-  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
-  key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3"/>',
-  card: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
-  note: '<path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/>',
-  terminal: '<path d="m4 17 6-5-6-5M12 19h8"/>',
-  braces: '<path d="M8 4c-2 0-3 1-3 3v2c0 1-1 2-2 3 1 1 2 2 2 3v2c0 2 1 3 3 3M16 4c2 0 3 1 3 3v2c0 1 1 2 2 3-1 1-2 2-2 3v2c0 2-1 3-3 3"/>',
-  wifi: '<path d="M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>',
-  id: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M6 16c.5-2 5.5-2 6 0M14 10h4M14 14h3"/>',
-  star: '<path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>',
-  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
-  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
-  eyeoff: '<path d="M3 3l18 18"/><path d="M10.6 6.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.7A17 17 0 0 0 2 12s3.6 7 10 7a10 10 0 0 0 4.4-1"/>',
-  check: '<path d="m5 12 5 5L20 7"/>',
-  x: '<path d="M6 6l12 12M18 6 6 18"/>',
-  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
-  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
-  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-  dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="15" r="1"/><circle cx="15" cy="9" r="1"/><circle cx="9" cy="15" r="1"/>',
-  upload: '<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>',
-  shield: '<path d="M12 3 4 6v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V6z"/>',
-  shieldcheck: '<path d="M12 3 4 6v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/>',
-  grid: '<rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-  settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
-  restore: '<path d="M4 12a8 8 0 1 0 3-6.2M4 4v4h4"/>',
-  alert: '<path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17.5v.01"/>',
-  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>',
-  scan: '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3M4 12h16"/>',
-  timer: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 3h6"/>',
-  cmd: '<path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z"/>',
-};
-
-// Builds DOM without innerHTML: imported data is untrusted.
-function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, any> = {}, ...kids: (Node | string | null | false | undefined)[]): HTMLElementTagNameMap[K] {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
-    else if (k === 'class') e.className = v;
-    else if (k === 'list' || k.startsWith('data-') || k.startsWith('aria-')) e.setAttribute(k, v);
-    else if (v !== undefined) (e as any)[k] = v;
-  }
-  for (const c of kids) if (c) e.append(c);
-  return e;
-}
-const put = (el: Element, ...kids: (Node | null | false | undefined)[]) => el.replaceChildren(...(kids.filter(Boolean) as Node[]));
-
-// Icons and the QR code are static strings or generated by our own Rust, never user text.
-function fromHtml(html: string): Element {
-  const t = document.createElement('template');
-  t.innerHTML = html.trim();
-  return t.content.firstElementChild as Element;
-}
-const icon = (name: string, cls = '') => fromHtml(`<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`);
-
+void masterDialog;
 const app = document.getElementById('app')!;
-let sums: Sum[] = [];
-let vis: Sum[] = [];
-let sel: string | null = null;
-let editing: Item | null = null;
-let filter = 'all';
-let query = '';
-let settings: Settings = { autolock_min: 5, clip_secs: 20 };
 let ticks: number[] = [];
 let idleTimer = 0;
-let toastTimer = 0;
-let mainActive = false;
-let layoutEl: HTMLElement, listEl: HTMLElement, detailEl: HTMLElement, navEl: HTMLElement, searchEl: HTMLInputElement;
+let searchTimer = 0;
+let layoutEl: HTMLElement, listEl: HTMLElement, detailEl: HTMLElement, navEl: HTMLElement, searchEl: HTMLInputElement, bulkEl: HTMLElement;
+let sortBy = 'name';
+const navOpen = (k: string, d = true) => { try { const v = localStorage.getItem('nav-' + k); return v === null ? d : v === '1'; } catch { return d; } };
+const setNavOpen = (k: string, v: boolean) => { try { localStorage.setItem('nav-' + k, v ? '1' : '0'); } catch { /* storage unavailable */ } };
 
-const call = <T = void>(cmd: string, args?: Record<string, unknown>) => invoke<T>(cmd, args);
-const err = (e: unknown) => toast(String(e), true);
-
-function toast(msg: string, bad = false) {
-  let t = document.getElementById('toast');
-  if (!t) { t = h('div', { id: 'toast' }); document.body.append(t); }
-  put(t, icon(bad ? 'alert' : 'check'), h('span', {}, msg));
-  t.className = bad ? 'bad show' : 'show';
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => t!.classList.remove('show'), bad ? 6000 : 2600);
-}
-
-async function copyText(text: string) {
-  try { await call('copy', { text }); toast(settings.clip_secs ? `Copied. The clipboard clears in ${settings.clip_secs} s.` : 'Copied.'); } catch (e) { err(e); }
-}
-
-const hue = (s: string) => { let n = 0; for (const c of s) n = (n * 31 + c.codePointAt(0)!) % 360; return n; };
-function avatar(kind: Kind, title: string, big = false) {
-  const a = h('div', { class: 'av' + (big ? ' big' : '') }, kind === 'login' ? h('span', {}, (title.trim()[0] || '?').toUpperCase()) : icon(KINDS[kind].icon));
-  a.style.setProperty('--h', String(hue(title)));
-  return a;
-}
-
-function ago(ts: number) {
-  const s = Math.max(0, Date.now() / 1000 - ts);
-  if (s < 60) return 'just now';
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  if (s < 86400 * 30) return `${Math.floor(s / 86400)} days ago`;
-  return new Date(ts * 1000).toLocaleDateString();
-}
-
-function iconBtn(name: string, title: string, onclick: (e: Event) => void, cls = '') {
-  return h('button', { type: 'button', class: 'icon ' + cls, title, 'aria-label': title, onclick }, icon(name));
-}
-
-/** Copy button that turns into a check mark for a moment. */
-function copyBtn(get: () => string) {
-  const b = iconBtn('copy', 'Copy', () => { copyText(get()); flashIcon(b); });
-  return b;
-}
-function flashIcon(b: HTMLElement) { b.replaceChildren(icon('check')); b.classList.add('done'); setTimeout(() => { b.replaceChildren(icon('copy')); b.classList.remove('done'); }, 1200); }
-
-// ---------- password strength ----------
-function meter() {
-  const bar = h('i'), lab = h('small');
-  const el = h('div', { class: 'meter' }, h('div', { class: 'track' }, bar), lab);
-  let seq = 0;
-  const update = async (pw: string) => {
-    const n = ++seq;
-    if (!pw) { bar.style.width = '0'; lab.textContent = ''; return; }
-    const s = await call<{ bits: number; level: string }>('strength', { password: pw });
-    if (n !== seq) return;
-    bar.style.width = Math.min(100, Math.round(s.bits)) + '%';
-    bar.className = s.level;
-    lab.textContent = s.level[0].toUpperCase() + s.level.slice(1);
-  };
-  return { el, update };
-}
-
-function pwField(id: string, placeholder: string) {
-  const input = h('input', { type: 'password', id, placeholder, autocomplete: 'off', spellcheck: false });
-  const eye = iconBtn('eye', 'Show', () => { const show = input.type === 'password'; input.type = show ? 'text' : 'password'; put(eye, icon(show ? 'eyeoff' : 'eye')); });
-  return { wrap: h('div', { class: 'pwf' }, input, eye), input };
-}
+const SMART: [string, string, string][] = [['flag:weak', 'Weak passwords', 'alert'], ['flag:reused', 'Reused passwords', 'copy'], ['flag:old', 'Old passwords', 'clock'], ['flag:http', 'No HTTPS', 'globe'], ['flag:nopass', 'No password', 'key'],
+  ['flag:notp', 'No 2FA code', 'timer'], ['flag:expiring', 'Expiring or expired', 'clock'], ['flag:dup', 'Duplicates', 'copy'], ['flag:files', 'With photos or files', 'clip']];
 
 // ---------- lock screen ----------
 async function showLock(auto = false) {
-  mainActive = false;
+  S.mainActive = false;
   clearTimeout(idleTimer);
   ticks.forEach(clearInterval); ticks = [];
-  sums = []; vis = []; sel = null; editing = null; filter = 'all'; query = '';
+  S.sums = []; S.vis = []; S.sel = null; S.editing = null; S.filter = 'all'; S.query = ''; S.qids = null; S.bulk = false; S.picked.clear(); S.pending = [];
   document.querySelectorAll('dialog').forEach(d => d.remove());
-  const { exists, quick } = await call<{ exists: boolean; quick: boolean }>('status');
+  const { exists, quick, recovery } = await call<{ exists: boolean; quick: boolean; recovery: boolean }>('status');
   if (auto && exists && quick) { // startup with "stay signed in": straight into the vault
     try { await call('quick_unlock'); return await showMain(); } catch { /* fall back to the password screen */ }
   }
@@ -189,14 +38,16 @@ async function showLock(auto = false) {
   const pw2 = exists ? null : pwField('pw2', 'Repeat master password');
   const m = exists ? null : meter();
   pw.input.addEventListener('input', () => m?.update(pw.input.value));
-  const msg = h('p', { class: 'hint', id: 'msg' }, exists ? '' : 'There is no way to recover this password. Write it down somewhere safe.');
+  const msg = h('p', { class: 'hint', id: 'msg' }, exists ? '' : 'There is no way to recover this password unless you create a recovery key later. Write it down somewhere safe.');
   const btn = h('button', { type: 'submit', class: 'primary big' }, exists ? 'Unlock' : 'Create vault');
   const stay = quick ? null : h('input', { type: 'checkbox', id: 'stay', checked: !exists });
   const stayRow = stay && h('label', { class: 'chk stay' }, stay, h('span', {}, exists ? 'Stay signed in on this PC' : 'Unlock automatically on this PC', h('small', {}, 'Uses your Windows sign-in to protect the key, so anyone using this Windows account can open the vault. You can turn it off in Settings.')));
   const form = h('form', { class: 'card lock' },
     h('div', { class: 'logo' }, icon('shield')), h('h1', {}, 'Vault'),
     h('p', { class: 'sub' }, exists ? 'Enter your master password to unlock.' : 'Create your vault. Everything stays encrypted on this PC.'),
-    quick ? btn : pw.wrap, pw2?.wrap, m?.el, stayRow, quick ? pw.wrap : btn, msg);
+    quick ? btn : pw.wrap, pw2?.wrap, m?.el, stayRow, quick ? pw.wrap : btn, msg,
+    exists && recovery ? h('button', { type: 'button', class: 'linkbtn', onclick: () => forgotDialog(() => showMain()) }, 'Forgot your master password?') : null,
+    exists ? null : h('button', { type: 'button', class: 'linkbtn', onclick: () => restoreDialog(() => showLock(false)) }, 'Already use Vault? Restore from my server'));
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const viaQuick = quick && !pw.input.value;
@@ -207,28 +58,29 @@ async function showLock(auto = false) {
       pw.input.value = ''; if (pw2) pw2.input.value = '';
       if (stay?.checked) await call('quick_enable').catch(err);
       await showMain();
-    }
-    catch (e) {
+    } catch (e) {
       msg.textContent = String(e); btn.disabled = false; btn.classList.remove('busy');
       form.classList.remove('shake'); void form.offsetWidth; form.classList.add('shake');
     }
   });
-  put(app, h('div', { class: 'center' }, h('i', { class: 'orb a' }), h('i', { class: 'orb b' }), form));
+  put(app, h('div', { class: 'center' }, h('i', { class: 'orb a' }), h('i', { class: 'orb b' }), h('i', { class: 'orb c' }), form));
   (quick ? btn : pw.input).focus();
 }
 
 // ---------- main screen ----------
 function resetIdle() {
   clearTimeout(idleTimer);
-  if (settings.autolock_min > 0) idleTimer = window.setTimeout(lockNow, settings.autolock_min * 60000);
+  if (S.settings.autolock_min > 0) idleTimer = window.setTimeout(lockNow, S.settings.autolock_min * 60000);
 }
 async function lockNow() { await call('lock'); await showLock(false); }
 
 async function showMain() {
-  settings = await call<Settings>('get_settings');
-  searchEl = h('input', { type: 'search', placeholder: 'Search   ( / )', 'aria-label': 'Search', oninput: () => { query = searchEl.value.toLowerCase(); renderList(true); } });
+  S.settings = await call<Settings>('get_settings');
+  applyTheme();
+  searchEl = h('input', { type: 'search', placeholder: 'Search   ( / )', 'aria-label': 'Search', oninput: () => { S.query = searchEl.value; clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 70); } });
   navEl = h('nav');
   listEl = h('div', { class: 'list' });
+  bulkEl = h('div', { class: 'bulkbar', hidden: true });
   detailEl = h('main', { class: 'detail' });
   const importInput = h('input', { type: 'file', accept: '.csv,text/csv', hidden: true, onchange: async () => {
     const f = importInput.files?.[0]; if (!f) return;
@@ -236,22 +88,38 @@ async function showMain() {
     catch (e) { err(e); }
     importInput.value = '';
   } });
+  const sort = h('select', { 'aria-label': 'Sort', title: 'Sort', onchange: () => { sortBy = sort.value; renderList(true); } },
+    h('option', { value: 'name' }, 'A–Z'), h('option', { value: 'recent' }, 'Recent'), h('option', { value: 'category' }, 'Category'), h('option', { value: 'kind' }, 'Type'));
   const side = (name: string, label: string, fn: () => void) => h('button', { class: 'side', onclick: fn }, icon(name), h('span', {}, label));
   layoutEl = h('div', { class: 'layout' },
     h('aside', {}, h('div', { class: 'brand' }, h('div', { class: 'logo sm' }, icon('shield')), h('b', {}, 'Vault')), navEl, h('div', { class: 'grow' }),
       side('cmd', 'Quick find', palette), side('dice', 'Generator', () => genDialog()), side('upload', 'Import CSV', () => importInput.click()),
-      side('settings', 'Settings', settingsDialog), side('key', 'Master password', masterDialog), side('lock', 'Lock', lockNow), importInput),
-    h('section', { class: 'col' }, h('div', { class: 'bar' }, h('div', { class: 'search' }, icon('search'), searchEl), h('button', { class: 'primary', onclick: newDialog }, icon('plus'), h('span', {}, 'New'))), listEl),
+      side('settings', 'Settings', settingsDialog), side('lock', 'Lock', lockNow), importInput),
+    h('section', { class: 'col' },
+      h('div', { class: 'bar' }, h('div', { class: 'search' }, icon('search'), searchEl, iconBtn('hash', 'Search tips', searchHelp, 'tipbtn')), h('button', { class: 'primary', onclick: () => newDialog(newItem) }, icon('plus'), h('span', {}, 'New'))),
+      h('div', { class: 'bar sub' }, sort, h('button', { class: 'ghost sm', id: 'selbtn', onclick: () => { S.bulk = !S.bulk; S.picked.clear(); renderList(); } }, icon('checksq'), h('span', {}, 'Select'))),
+      listEl, bulkEl),
     detailEl);
   put(app, layoutEl);
-  mainActive = true;
+  S.mainActive = true;
   resetIdle();
   await reload();
+  try {
+    const a = await call<Audit>('security_audit');
+    if (a.expiring.length) toast(`${a.expiring.length} item${a.expiring.length === 1 ? ' is' : 's are'} expiring or expired: ${a.expiring.slice(0, 2).map(r => r.title).join(', ')}${a.expiring.length > 2 ? '…' : ''}`, true);
+  } catch { /* nothing to warn about */ }
+  if (S.settings.check_updates) hooks.checkUpdate(false);
 }
 
 async function reload() {
-  try { sums = await call<Sum[]>('list'); } catch (e) { err(e); return; }
+  try { S.sums = await call<Sum[]>('list'); } catch (e) { err(e); return; }
+  await runSearch(false);
   renderNav(); renderList(); renderDetail();
+}
+
+async function runSearch(redraw = true) {
+  if (S.query.trim()) { try { S.qids = await call<string[]>('search', { query: S.query, trash: S.filter === 'trash' }); } catch { S.qids = null; } } else S.qids = null;
+  if (redraw) { renderList(true); renderNav(); }
 }
 
 function matches(s: Sum, f: string) {
@@ -259,74 +127,125 @@ function matches(s: Sum, f: string) {
   if (f === 'fav') return s.favorite;
   if (f.startsWith('kind:')) return s.kind === f.slice(5);
   if (f.startsWith('folder:')) return s.folder === f.slice(7);
+  if (f.startsWith('tag:')) return s.tags.includes(f.slice(4));
+  if (f.startsWith('cat:')) return s.category === f.slice(4);
+  if (f.startsWith('flag:')) return s.flags.includes(f.slice(5));
   return false;
 }
 
 function go(key: string) {
-  filter = key; sel = null; editing = null;
+  S.filter = key; S.sel = null; S.editing = null; S.pending = [];
   layoutEl.classList.toggle('wide', key === 'security' || key === 'auth');
-  renderNav(); renderList(true); renderDetail();
+  runSearch(false).then(() => { renderNav(); renderList(true); renderDetail(); });
 }
+hooks.go = go; hooks.reload = reload; hooks.renderDetail = () => renderDetail(); hooks.renderList = a => renderList(a); hooks.renderNav = () => renderNav(); hooks.lockNow = lockNow; hooks.resetIdle = resetIdle;
 
 function renderNav() {
-  const alive = sums.filter(s => !s.deleted);
+  const alive = S.sums.filter(s => !s.deleted);
   const n = (f: string) => alive.filter(s => matches(s, f)).length;
-  const entry = (key: string, label: string, ic: string, count: number | string = '', badge = false) =>
-    h('button', { class: key === filter ? 'nav on' : 'nav', onclick: () => go(key) }, icon(ic), h('span', { class: 'lbl' }, label), count !== '' && h('span', { class: badge ? 'n badge' : 'n' }, String(count)));
+  const entry = (key: string, label: string, ic: string, count: number | string = '', badge = false, color?: string) => {
+    const b = h('button', { class: key === S.filter ? 'nav on' : 'nav', onclick: () => go(key) }, icon(ic), h('span', { class: 'lbl' }, label), count !== '' && h('span', { class: badge ? 'n badge' : 'n' }, String(count)));
+    if (color) b.style.setProperty('--kc', color);
+    return b;
+  };
+  const group = (id: string, title: string, items: Node[], def = true) => items.length ? h('details', { class: 'ngroup', open: navOpen(id, def), ontoggle: (e: Event) => setNavOpen(id, (e.target as HTMLDetailsElement).open) }, h('summary', {}, title), ...items) : null;
   const folders = [...new Set(alive.map(s => s.folder).filter(Boolean))].sort();
+  const tags = [...new Set(alive.flatMap(s => s.tags))].sort();
+  const cats = [...new Set(alive.map(s => s.category))].sort();
+  const smart = SMART.filter(([k]) => n(k) > 0 || k === S.filter);
   put(navEl,
     entry('all', 'All items', 'grid', alive.length), entry('fav', 'Favorites', 'star', n('fav')),
-    h('div', { class: 'sec' }, 'Types'),
-    ...KIND_ORDER.filter(k => n('kind:' + k) > 0 || ['login', 'card', 'note'].includes(k)).map(k => entry('kind:' + k, KINDS[k].plural, KINDS[k].icon, n('kind:' + k))),
-    folders.length ? h('div', { class: 'sec' }, 'Folders') : null,
-    ...folders.map(f => entry('folder:' + f, f, 'folder', n('folder:' + f))),
-    h('div', { class: 'sec' }, 'Tools'),
-    entry('auth', 'Authenticator', 'timer'), entry('security', 'Security center', 'shieldcheck'), entry('trash', 'Trash', 'trash', sums.filter(s => s.deleted).length || ''));
+    group('types', 'Types', KIND_ORDER.filter(k => n('kind:' + k) > 0 || ['login', 'card', 'note'].includes(k)).map(k => entry('kind:' + k, KINDS[k].plural, KINDS[k].icon, n('kind:' + k), false, KINDS[k].color))),
+    group('smart', 'Smart filters', smart.map(([k, l, i]) => entry(k, l, i, n(k), ['flag:weak', 'flag:reused', 'flag:expiring'].includes(k)))),
+    group('cats', 'Categories', cats.map(c => entry('cat:' + c, c, 'hash', n('cat:' + c), false, CATEGORY_COLORS[c])), false),
+    group('folders', 'Folders', folders.map(f => entry('folder:' + f, f, 'folder', n('folder:' + f))), false),
+    group('tags', 'Tags', tags.map(t => entry('tag:' + t, t, 'tag', n('tag:' + t))), false),
+    group('tools', 'Tools', [entry('auth', 'Authenticator', 'timer'), entry('security', 'Security center', 'shieldcheck'), entry('trash', 'Trash', 'trash', S.sums.filter(s => s.deleted).length || '')]));
 }
 
+const SORTS: Record<string, (a: Sum, b: Sum) => number> = {
+  name: (a, b) => a.title.localeCompare(b.title),
+  recent: (a, b) => b.updated - a.updated || a.title.localeCompare(b.title),
+  category: (a, b) => a.category.localeCompare(b.category) || a.title.localeCompare(b.title),
+  kind: (a, b) => a.kind.localeCompare(b.kind) || a.title.localeCompare(b.title),
+};
+
 function renderList(animate = false) {
-  if (filter === 'security' || filter === 'auth') return;
-  const rows = sums
-    .filter(s => filter === 'trash' ? s.deleted : !s.deleted && matches(s, filter))
-    .filter(s => !query || [s.title, s.sub, s.folder].some(x => x.toLowerCase().includes(query)))
-    .sort((a, b) => a.title.localeCompare(b.title));
-  vis = rows;
+  if (S.filter === 'security' || S.filter === 'auth') return;
+  const inTrash = S.filter === 'trash';
+  let rows = S.sums.filter(s => inTrash ? s.deleted : !s.deleted && matches(s, S.filter));
+  if (S.qids) { const order = new Map(S.qids.map((id, i) => [id, i])); rows = rows.filter(s => order.has(s.id)).sort((a, b) => order.get(a.id)! - order.get(b.id)!); }
+  else rows.sort(SORTS[sortBy]);
+  S.vis = rows;
   listEl.className = 'list' + (animate ? ' enter' : '');
+  document.getElementById('selbtn')?.classList.toggle('on', S.bulk);
+  renderBulk();
   if (!rows.length) {
-    const none = sums.length === 0;
-    return put(listEl, h('div', { class: 'empty small' }, icon(filter === 'trash' ? 'trash' : 'shield', 'big'),
-      h('p', {}, filter === 'trash' ? 'The trash is empty.' : none ? 'Your vault is empty.' : 'Nothing matches.'),
-      none && filter !== 'trash' ? h('button', { class: 'primary', onclick: newDialog }, 'Add your first item') : null));
+    const none = S.sums.length === 0;
+    return put(listEl, h('div', { class: 'empty small' }, icon(inTrash ? 'trash' : 'shield', 'big'),
+      h('p', {}, inTrash ? 'The trash is empty.' : none ? 'Your vault is empty.' : S.query ? 'Nothing matches that search.' : 'Nothing here.'),
+      none && !inTrash ? h('button', { class: 'primary', onclick: () => newDialog(newItem) }, 'Add your first item') : null));
   }
-  put(listEl, filter === 'trash' ? h('div', { class: 'trashbar' }, h('small', {}, 'Items are deleted for good after 30 days.'), h('button', { class: 'danger', onclick: emptyTrash }, 'Empty trash')) : null,
+  put(listEl, inTrash ? h('div', { class: 'trashbar' }, h('small', {}, 'Items are deleted for good after 30 days.'), h('button', { class: 'danger', onclick: emptyTrash }, 'Empty trash')) : null,
     ...rows.map((s, i) => {
-      const r = h('button', { class: s.id === sel ? 'row on' : 'row', 'data-id': s.id, onclick: () => { sel = s.id; editing = null; markSel(); renderDetail(); } },
-        avatar(s.kind, s.title), h('div', { class: 't' }, h('b', {}, s.title), h('small', {}, s.sub || s.folder || KINDS[s.kind].label)), s.favorite ? icon('star', 'fav') : null);
+      const warn = s.flags.includes('weak') || s.flags.includes('reused') ? icon('alert', 'warn') : null;
+      const r = h('button', { class: 'row' + (s.id === S.sel && !S.bulk ? ' on' : '') + (S.picked.has(s.id) ? ' picked' : ''), 'data-id': s.id, onclick: () => {
+        if (S.bulk) { S.picked.has(s.id) ? S.picked.delete(s.id) : S.picked.add(s.id); renderList(); return; }
+        S.sel = s.id; S.editing = null; markSel(); renderDetail();
+      } },
+        S.bulk ? h('span', { class: 'cb' + (S.picked.has(s.id) ? ' on' : '') }, S.picked.has(s.id) ? icon('check') : null) : null,
+        avatar(s.kind, s.title), h('div', { class: 't' }, h('b', {}, s.title), h('small', {}, s.sub || s.domain || KINDS[s.kind]?.label || '')),
+        warn, s.files ? icon('clip', 'dim') : null, s.favorite ? icon('star', 'fav') : null);
       r.style.setProperty('--i', String(Math.min(i, 12)));
+      r.style.setProperty('--kc', KINDS[s.kind]?.color ?? '#9aa4b8');
       return r;
     }));
 }
 
+function renderBulk() {
+  bulkEl.hidden = !S.bulk;
+  if (!S.bulk) return;
+  const ids = [...S.picked], inTrash = S.filter === 'trash';
+  const act = async (op: string, value = '', msg = 'Done') => { if (!ids.length) return; try { const n = await call<number>('bulk', { ids, op, value }); S.picked.clear(); await reload(); toast(`${msg} (${n})`); } catch (e) { err(e); } };
+  put(bulkEl, h('b', {}, `${ids.length} selected`),
+    h('button', { class: 'ghost sm', onclick: () => { S.vis.forEach(s => S.picked.add(s.id)); renderList(); } }, 'All'),
+    inTrash ? h('button', { class: 'sm', disabled: !ids.length, onclick: () => act('restore', '', 'Restored') }, icon('restore'), h('span', {}, 'Restore')) : h('button', { class: 'sm', disabled: !ids.length, title: 'Add to favorites', onclick: () => act('favorite', '', 'Favorited') }, icon('star')),
+    !inTrash ? h('button', { class: 'sm', disabled: !ids.length, title: 'Move to a folder', onclick: async () => { const f = await ask('Move to folder', 'Folder name', '', 'Move', 'Leave empty to take them out of any folder.'); if (f !== null) act('folder', f, 'Moved'); } }, icon('folder')) : null,
+    !inTrash ? h('button', { class: 'sm', disabled: !ids.length, title: 'Add a tag', onclick: async () => { const t = await ask('Add a tag', 'Tag', '', 'Add'); if (t) act('tag', t, 'Tagged'); } }, icon('tag')) : null,
+    !inTrash ? h('button', { class: 'sm danger', disabled: !ids.length, title: 'Move to the trash', onclick: () => act('trash', '', 'Moved to the trash') }, icon('trash')) : null,
+    h('button', { class: 'sm', onclick: () => { S.bulk = false; S.picked.clear(); renderList(); } }, 'Done'));
+}
+
 function markSel() {
-  listEl.querySelectorAll<HTMLElement>('.row').forEach(r => r.classList.toggle('on', r.dataset.id === sel));
+  listEl.querySelectorAll<HTMLElement>('.row').forEach(r => r.classList.toggle('on', r.dataset.id === S.sel));
   listEl.querySelector('.row.on')?.scrollIntoView({ block: 'nearest' });
 }
 
 function moveSel(d: number) {
-  if (!vis.length || editing) return;
-  const i = vis.findIndex(s => s.id === sel);
-  sel = vis[Math.max(0, Math.min(vis.length - 1, i < 0 ? (d > 0 ? 0 : vis.length - 1) : i + d))].id;
+  if (!S.vis.length || S.editing || S.bulk) return;
+  const i = S.vis.findIndex(s => s.id === S.sel);
+  S.sel = S.vis[Math.max(0, Math.min(S.vis.length - 1, i < 0 ? (d > 0 ? 0 : S.vis.length - 1) : i + d))].id;
   markSel(); renderDetail();
 }
 
-function openItem(id: string) {
-  filter = 'all'; query = ''; searchEl.value = ''; sel = id; editing = null;
-  layoutEl.classList.remove('wide'); renderNav(); renderList(true); renderDetail(); markSel();
+async function emptyTrash() {
+  if (!await confirmDialog('Empty the trash?', 'These items and their files will be deleted for good.', 'Delete forever', true)) return;
+  try { await call('empty_trash'); S.sel = null; await reload(); toast('Trash emptied'); } catch (e) { err(e); }
 }
 
-async function emptyTrash() {
-  dialog(close => [h('h3', {}, 'Empty the trash?'), h('p', { class: 'hint' }, 'These items will be deleted for good.'),
-    h('div', { class: 'btns' }, h('button', { class: 'danger', onclick: async () => { close(); try { await call('empty_trash'); sel = null; await reload(); toast('Trash emptied'); } catch (e) { err(e); } } }, 'Delete forever'), h('button', { onclick: close }, 'Cancel'))]);
+function openItem(id: string) {
+  S.filter = 'all'; S.query = ''; searchEl.value = ''; S.qids = null; S.sel = id; S.editing = null; S.bulk = false;
+  layoutEl.classList.remove('wide'); renderNav(); renderList(true); renderDetail(); markSel();
+}
+hooks.openItem = openItem;
+
+function newItem(k: Kind, tpl?: Template) {
+  S.sel = null; S.pending = [];
+  if (['security', 'trash', 'auth'].includes(S.filter)) go('all');
+  const fields = tpl ? tpl.fields.map(f => F(f.label, f.kind as FKind)) : TEMPLATES[k]();
+  S.editing = { id: '', kind: k, title: '', folder: S.filter.startsWith('folder:') ? S.filter.slice(7) : '', fields, notes: '', favorite: false, updated: 0, history: [], deleted: 0,
+    tags: S.filter.startsWith('tag:') ? [S.filter.slice(4)] : [], expires: '', attachments: [], category: '', versions: [] };
+  renderList(); renderDetail();
 }
 
 // ---------- detail ----------
@@ -335,36 +254,66 @@ const emptyDetail = () => h('div', { class: 'empty' }, icon('shieldcheck', 'big'
 
 async function renderDetail() {
   ticks.forEach(clearInterval); ticks = [];
-  if (filter === 'security') return renderSecurity();
-  if (filter === 'auth') return renderAuth();
-  if (editing) return renderEdit(editing);
-  if (!sel) return put(detailEl, emptyDetail());
+  if (S.filter === 'security') return renderSecurity();
+  if (S.filter === 'auth') return renderAuth();
+  if (S.editing) return renderEdit(S.editing);
+  if (!S.sel) return put(detailEl, emptyDetail());
   let it: Item;
-  try { it = await call<Item>('get_item', { id: sel }); } catch { sel = null; return renderDetail(); }
-  if (sel !== it.id || editing) return; // user moved on while we waited
+  try { it = await call<Item>('get_item', { id: S.sel }); } catch { S.sel = null; return renderDetail(); }
+  if (S.sel !== it.id || S.editing) return; // user moved on while we waited
   ticks.forEach(clearInterval); ticks = [];
-  const k = KINDS[it.kind];
+  const k = KINDS[it.kind] ?? KINDS.other;
+  const auto = S.sums.find(s => s.id === it.id)?.category ?? '';
+  const act = (fn: () => Promise<void>) => async () => { try { await fn(); } catch (e) { err(e); } };
   const acts = it.deleted
-    ? [h('button', { onclick: async () => { try { await call('restore_item', { id: it.id }); await reload(); toast('Restored'); } catch (e) { err(e); } } }, icon('restore'), h('span', {}, 'Restore')), delForever(it)]
-    : [iconBtn('star', it.favorite ? 'Remove from favorites' : 'Add to favorites', async () => { try { await call('save_item', { item: { ...it, favorite: !it.favorite } }); await reload(); } catch (e) { err(e); } }, it.favorite ? 'on' : ''),
-       h('button', { onclick: () => { editing = structuredClone(it); renderDetail(); } }, icon('edit'), h('span', {}, 'Edit'))];
+    ? [h('button', { onclick: act(async () => { await call('restore_item', { id: it.id }); await reload(); toast('Restored'); }) }, icon('restore'), h('span', {}, 'Restore')), delForever(it)]
+    : [iconBtn('star', it.favorite ? 'Remove from favorites' : 'Add to favorites', act(async () => { await call('save_item', { item: { ...it, favorite: !it.favorite } }); await reload(); }), it.favorite ? 'on' : ''),
+       iconBtn('history', `Version history (${it.versions.length})`, () => versionsDialog(it)), iconBtn('copy', 'Duplicate', act(async () => { const id = await call<string>('duplicate_item', { id: it.id }); await reload(); openItem(id); toast('Duplicated'); })),
+       it.kind !== 'passkey' ? iconBtn('share', 'Share as an encrypted file', () => shareDialog(it)) : null,
+       h('button', { onclick: () => { S.editing = structuredClone(it); S.pending = []; renderDetail(); } }, icon('edit'), h('span', {}, 'Edit'))];
   const shown = it.fields.filter(f => f.value);
-  put(detailEl,
-    h('div', { class: 'head' }, avatar(it.kind, it.title, true), h('div', { class: 'ttl' }, h('h2', {}, it.title), h('small', { class: 'hint' }, [k.label, it.folder].filter(Boolean).join(' · '))), h('div', { class: 'acts' }, ...acts)),
-    it.kind === 'card' ? wallet(it) : null,
+  const dueIn = it.expires ? Math.floor((Date.parse(it.expires + 'T00:00:00') - Date.now()) / 86400000) + 1 : null;
+  const chips = [chip(k.label, k.color, k.icon), auto && chip(auto, CATEGORY_COLORS[auto]), it.folder && chip(it.folder, undefined, 'folder'), ...it.tags.map(t => chip(t, undefined, 'tag')),
+    dueIn !== null && chip(dueIn < 0 ? `Expired ${-dueIn} d ago` : dueIn === 0 ? 'Expires today' : `Expires in ${dueIn} d`, dueIn <= 14 ? '#ff6b6b' : '#9aa4b8', 'clock'),
+    it.kind === 'login' && !it.fields.some(f => f.label === 'Password' && f.value) && chip('No password: passkey or single sign-on', '#9aa4b8')];
+  const photos = it.attachments.length ? h('div', { class: 'photos' }, ...it.attachments.map(a => attachmentTile(it, a, false, () => renderDetail()))) : null;
+  const head = h('div', { class: 'head' }, avatar(it.kind, it.title, true), h('div', { class: 'ttl' }, h('h2', {}, it.title), h('div', { class: 'chips' }, ...chips)), h('div', { class: 'acts' }, ...acts));
+  head.style.setProperty('--kc', k.color);
+  put(detailEl, head,
+    ['card', 'bank'].includes(it.kind) ? walletCard(it) : null,
     it.kind === 'wifi' ? await wifiQr(it) : null,
+    it.kind === 'document' ? photos : null,
     shown.length ? h('div', { class: 'group' }, ...shown.map(viewField)) : null,
-    it.notes ? h('div', { class: 'group' }, h('div', { class: 'f' }, h('div', { class: 'l' }, 'Notes'), h('pre', { class: 'notes' }, it.notes))) : null,
-    it.history.length ? h('details', { class: 'group hist' }, h('summary', {}, icon('clock'), ` History (${it.history.length})`),
+    it.kind === 'identity' ? addressBlock(it) : null,
+    it.kind === 'api' ? apiBlock(it) : null,
+    it.kind !== 'document' && photos ? h('div', { class: 'sect' }, h('h3', {}, icon('image'), ' Photos and files'), photos) : null,
+    it.notes ? h('div', { class: 'group' }, h('div', { class: 'f static' }, h('div', { class: 'l' }, 'Notes'), h('div', { class: 'md' }, ...renderMd(it.notes, async line => { await call('save_item', { item: { ...it, notes: toggleLine(it.notes, line) } }); renderDetail(); })))) : null,
+    it.history.length ? h('details', { class: 'group hist' }, h('summary', {}, icon('clock'), ` Earlier passwords and secrets (${it.history.length})`),
       ...it.history.slice().reverse().map(x => viewField({ label: `Previous ${x.label} · ${ago(x.at)}`, value: x.value, kind: 'secret' }))) : null,
     h('small', { class: 'hint foot', title: new Date(it.updated * 1000).toLocaleString() }, 'Changed ' + ago(it.updated)));
+}
+
+function renderMd(text: string, toggle: (line: number) => void): Node[] {
+  const inl = (xs: Inl[]): Node[] => xs.map(x => x.t === 'b' ? h('strong', {}, x.v) : x.t === 'i' ? h('em', {}, x.v) : x.t === 'code' ? h('code', {}, x.v) : x.t === 'link' ? h('a', { class: 'mdlink', title: 'Click to copy the link', onclick: (e: Event) => { e.preventDefault(); copyText(x.v); } }, x.v) : document.createTextNode(x.v));
+  const blk = (b: Block): Node => {
+    switch (b.t) {
+      case 'h': return h(('h' + (b.n + 2)) as 'h3', {}, ...inl(b.inl));
+      case 'p': return h('p', {}, ...inl(b.inl));
+      case 'quote': return h('blockquote', {}, ...inl(b.inl));
+      case 'code': return h('pre', { class: 'mdcode' }, b.text);
+      case 'hr': return h('hr');
+      default: return h(b.t, {}, ...b.items.map(i => h('li', { class: i.check === undefined ? '' : 'task' + (i.check ? ' done' : '') },
+        i.check === undefined ? null : h('input', { type: 'checkbox', checked: i.check, onchange: () => toggle(i.line) }), h('span', {}, ...inl(i.inl)))));
+    }
+  };
+  return parseMd(text).map(blk);
 }
 
 function delForever(it: Item) {
   let armed = false;
   const b = h('button', { class: 'danger', onclick: async () => {
     if (!armed) { armed = true; put(b, icon('trash'), h('span', {}, 'Click again to delete')); return; }
-    try { await call('delete_item', { id: it.id }); sel = null; await reload(); toast('Deleted for good'); } catch (e) { err(e); }
+    try { await call('delete_item', { id: it.id }); S.sel = null; await reload(); toast('Deleted for good'); } catch (e) { err(e); }
   } }, icon('trash'), h('span', {}, 'Delete forever'));
   return b;
 }
@@ -376,15 +325,45 @@ async function wifiQr(it: Item) {
   catch { return null; }
 }
 
-function wallet(it: Item) {
+function walletCard(it: Item) {
   const g = (l: string) => it.fields.find(f => f.label === l)?.value || '';
+  if (it.kind === 'bank') {
+    const acc = g('Account number').replace(/\s/g, ''), iban = g('IBAN').replace(/\s/g, '');
+    const w = h('div', { class: 'wallet bank' }, h('div', { class: 'top' }, h('b', {}, g('Bank name') || it.title), icon('bank')),
+      h('div', { class: 'num' }, iban ? iban.slice(0, 4) + ' •••• •••• ' + iban.slice(-4) : '•••• ' + (acc.slice(-4) || '••••')), h('div', { class: 'bot' }, h('span', {}, g('Account holder')), h('span', {}, g('SWIFT / BIC'))));
+    w.style.setProperty('--h', String(hue(it.title)));
+    return w;
+  }
   const num = g('Card number').replace(/\D/g, '');
   const brand = /^4/.test(num) ? 'VISA' : /^(5[1-5]|2[2-7])/.test(num) ? 'Mastercard' : /^3[47]/.test(num) ? 'AMEX' : /^6/.test(num) ? 'Discover' : '';
   const w = h('div', { class: 'wallet' }, h('div', { class: 'top' }, h('i', { class: 'chip' }), h('b', {}, brand)),
-    h('div', { class: 'num' }, '•••• •••• •••• ' + (num.slice(-4) || '••••')),
-    h('div', { class: 'bot' }, h('span', {}, g('Cardholder') || it.title), h('span', {}, g('Expiry'))));
+    h('div', { class: 'num' }, '•••• •••• •••• ' + (num.slice(-4) || '••••')), h('div', { class: 'bot' }, h('span', {}, g('Cardholder') || it.title), h('span', {}, g('Expiry'))));
   w.style.setProperty('--h', String(hue(it.title)));
   return w;
+}
+
+function addressBlock(it: Item) {
+  const g = (l: string) => it.fields.find(f => f.label === l)?.value.trim() || '';
+  const lines = [g('Full name') || [g('First name'), g('Last name')].filter(Boolean).join(' '), g('Company'), g('Address line 1'), g('Address line 2'), [g('Postal code'), g('City')].filter(Boolean).join(' '), g('State / region'), g('Country')].filter(Boolean);
+  if (lines.length < 2) return null;
+  return h('div', { class: 'sect' }, h('div', { class: 'addr' }, h('pre', {}, lines.join('\n')), h('button', { onclick: () => copyText(lines.join('\n')) }, icon('copy'), h('span', {}, 'Copy full address'))));
+}
+
+function apiBlock(it: Item) {
+  const g = (l: string) => it.fields.find(f => f.label === l)?.value || '';
+  const key = g('Secret key') || g('Key');
+  if (!key) return null;
+  const name = ((g('Service') || it.title).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '') || 'API') + '_API_KEY';
+  return h('div', { class: 'sect' }, h('div', { class: 'btns' },
+    h('button', { onclick: () => copyText(`${name}=${key}`) }, icon('terminal'), h('span', {}, `Copy as ${name}=…`)),
+    h('button', { onclick: () => copyText(`export ${name}=${key}`) }, icon('terminal'), h('span', {}, 'Copy as export …')),
+    h('button', { onclick: () => copyText(`$env:${name}="${key}"`) }, icon('terminal'), h('span', {}, 'Copy for PowerShell'))));
+}
+
+function ringEl() {
+  const el = fromHtml('<svg class="ring" viewBox="0 0 36 36"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" cx="18" cy="18" r="15"/><text x="18" y="22" text-anchor="middle"></text></svg>');
+  const fg = el.querySelector('.fg') as SVGElement, txt = el.querySelector('text')!;
+  return { el, set(left: number, period: number) { txt.textContent = String(left); fg.style.strokeDashoffset = String(94.25 * (1 - left / period)); } };
 }
 
 function jwt(v: string): any | null {
@@ -393,11 +372,7 @@ function jwt(v: string): any | null {
   try { return JSON.parse(atob(p[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(p[1].length / 4) * 4, '='))); } catch { return null; }
 }
 
-function ringEl() {
-  const el = fromHtml('<svg class="ring" viewBox="0 0 36 36"><circle class="bg" cx="18" cy="18" r="15"/><circle class="fg" cx="18" cy="18" r="15"/><text x="18" y="22" text-anchor="middle"></text></svg>');
-  const fg = el.querySelector('.fg') as SVGElement, txt = el.querySelector('text')!;
-  return { el, set(left: number, period: number) { txt.textContent = String(left); fg.style.strokeDashoffset = String(94.25 * (1 - left / period)); } };
-}
+const groupDigits = (v: string) => v.replace(/\s/g, '').replace(/(.{4})/g, '$1 ').trim();
 
 function viewField(f: Field): HTMLElement {
   const val = h('div', { class: 'val' });
@@ -420,8 +395,9 @@ function viewField(f: Field): HTMLElement {
     tick(); ticks.push(window.setInterval(tick, 1000));
   } else {
     const masked = f.kind === 'secret' || f.kind === 'multiline';
+    const grouped = ['IBAN', 'Card number', 'Account number'].includes(f.label);
     let shown = false;
-    const paint = () => { val.textContent = masked && !shown ? '••••••••••' : f.value; val.classList.toggle('pre', f.kind === 'multiline' && shown); };
+    const paint = () => { val.textContent = masked && !shown ? '••••••••••' : grouped ? groupDigits(f.value) : f.value; val.classList.toggle('pre', f.kind === 'multiline' && shown); };
     paint();
     if (masked) { const eye = iconBtn('eye', 'Show or hide', () => { shown = !shown; paint(); put(eye, icon(shown ? 'eyeoff' : 'eye')); }); acts.append(eye); }
     const claims = jwt(f.value);
@@ -441,13 +417,25 @@ function viewField(f: Field): HTMLElement {
 }
 
 // ---------- edit ----------
-function renderEdit(it: Item) {
+async function renderEdit(it: Item) {
   const isNew = !it.id;
+  const cats = await call<string[]>('categories_list');
   const title = h('input', { value: it.title, placeholder: 'Title', class: 'big', oninput: () => it.title = title.value });
   const folder = h('input', { value: it.folder, placeholder: 'Folder (optional)', list: 'folders', oninput: () => it.folder = folder.value });
-  const dl = h('datalist', { id: 'folders' }, ...[...new Set(sums.map(s => s.folder).filter(Boolean))].map(f => h('option', { value: f })));
+  const dl = h('datalist', { id: 'folders' }, ...[...new Set(S.sums.map(s => s.folder).filter(Boolean))].map(f => h('option', { value: f })));
   const fav = h('input', { type: 'checkbox', checked: it.favorite, onchange: () => it.favorite = fav.checked });
-  const notes = h('textarea', { value: it.notes, rows: 4, placeholder: 'Notes', oninput: () => it.notes = notes.value });
+  const cat = h('select', { 'aria-label': 'Category', onchange: () => it.category = cat.value }, h('option', { value: '', selected: !it.category }, 'Category: automatic'), ...cats.map(c => h('option', { value: c, selected: c === it.category }, c)));
+  const exp = h('input', { type: 'date', value: it.expires, title: 'Expiry or rotation date: Vault warns you before it', oninput: () => it.expires = exp.value });
+  const tagBox = h('div', { class: 'tagbox' });
+  const tagIn = h('input', { placeholder: 'Add tag…', list: 'taglist', onkeydown: (e: KeyboardEvent) => {
+    if ((e.key === 'Enter' || e.key === ',') && tagIn.value.trim()) { e.preventDefault(); addTag(tagIn.value.trim().replace(/,$/, '')); tagIn.value = ''; }
+    else if (e.key === 'Backspace' && !tagIn.value && it.tags.length) { it.tags.pop(); paintTags(); }
+  } });
+  const addTag = (t: string) => { if (t && !it.tags.includes(t)) it.tags.push(t); paintTags(); };
+  const paintTags = () => put(tagBox, icon('tag'), ...it.tags.map(t => h('span', { class: 'chip rm', onclick: () => { it.tags = it.tags.filter(x => x !== t); paintTags(); } }, t, icon('x'))), tagIn);
+  const tl = h('datalist', { id: 'taglist' }, ...[...new Set(S.sums.flatMap(s => s.tags))].map(t => h('option', { value: t })));
+  paintTags();
+  const notes = h('textarea', { value: it.notes, rows: 4, placeholder: 'Notes (Markdown: # headings, **bold**, - [ ] checklists)', oninput: () => it.notes = notes.value });
   const rows = h('div', { class: 'group edit-fields' });
   const paintRows = () => put(rows, ...it.fields.map((f, i) => {
     const multi = f.kind === 'multiline';
@@ -461,7 +449,7 @@ function renderEdit(it: Item) {
       f.kind === 'secret' ? iconBtn('dice', 'Generate a password', () => genDialog(pw => { f.value = pw; paintRows(); })) : null,
       f.kind === 'totp' ? iconBtn('scan', 'Scan a QR code on the screen', async () => {
         try {
-          const p = await call<Parsed>('scan_screen'); const a = p.accounts[0];
+          const p = await call<{ accounts: { title: string; account: string; uri: string }[] }>('scan_screen'); const a = p.accounts[0];
           if (!a) return toast('No 2FA code found', true);
           f.value = a.uri;
           if (!it.title.trim()) { it.title = a.title; title.value = a.title; }
@@ -473,17 +461,48 @@ function renderEdit(it: Item) {
       iconBtn('x', 'Remove field', () => { it.fields.splice(i, 1); paintRows(); }));
   }));
   paintRows();
+  const files = h('div', { class: 'group attgroup' });
+  const refreshAtts = async () => { if (!isNew) { const fresh = await call<Item>('get_item', { id: it.id }); it.attachments = fresh.attachments; } paintFiles(); };
+  const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: async () => { await attachFiles([...(fileIn.files ?? [])], isNew ? null : it.id); fileIn.value = ''; await refreshAtts(); } });
+  const paintFiles = () => put(files,
+    h('div', { class: 'photos' }, ...it.attachments.map(a => attachmentTile(it, a, true, refreshAtts)), ...S.pending.map((p, i) =>
+      h('div', { class: 'att' }, isImage(p.name) ? h('button', { type: 'button', class: 'thumb' }, h('img', { alt: p.name, src: `data:image/jpeg;base64,${p.data}` })) : h('button', { type: 'button', class: 'thumb file' }, icon('doc')),
+        h('div', { class: 'cap' }, h('span', {}, p.name), h('small', {}, 'saved with the item')), iconBtn('x', 'Remove', () => { S.pending.splice(i, 1); paintFiles(); }, 'rm')))),
+    h('div', { class: 'btns pad' }, h('button', { type: 'button', onclick: () => fileIn.click() }, icon('clip'), h('span', {}, 'Add photos or files…')),
+      h('button', { type: 'button', onclick: () => photoDialog(async (name, data) => { await attachFiles([{ name, data }], isNew ? null : it.id); await refreshAtts(); }) }, icon('camera'), h('span', {}, 'Take a photo')),
+      h('small', { class: 'hint' }, 'Photos, PDFs and documents are encrypted. You can also paste a copied image with Ctrl+V.')));
+  void refreshAtts();
+  const docChips = it.kind === 'document' ? h('div', { class: 'chips pickers' }, ...DOC_TYPES.map(t => h('button', { type: 'button', class: 'chipbtn pick', onclick: () => {
+    let f = it.fields.find(x => x.label === 'Document type'); if (!f) { f = F('Document type'); it.fields.unshift(f); }
+    f.value = t; if (!it.title.trim()) { it.title = t; title.value = t; } paintRows();
+  } }, t))) : null;
   const del = !isNew && h('button', { type: 'button', class: 'danger', onclick: async () => {
-    try { await call('delete_item', { id: it.id }); sel = null; editing = null; await reload(); toast('Moved to the trash'); } catch (e) { err(e); }
+    try { await call('delete_item', { id: it.id }); S.sel = null; S.editing = null; await reload(); toast('Moved to the trash'); } catch (e) { err(e); }
   } }, icon('trash'), h('span', {}, 'Delete'));
   const form = h('form', { class: 'edit', onsubmit: async (ev: Event) => {
     ev.preventDefault();
-    try { const id = await call<string>('save_item', { item: { ...it, fields: it.fields.filter(f => f.label.trim() || f.value) } }); sel = id; editing = null; await reload(); toast('Saved'); }
-    catch (e) { err(e); }
+    try {
+      const id = await call<string>('save_item', { item: { ...it, fields: it.fields.filter(f => f.label.trim() || f.value) } });
+      if (S.pending.length) await attachFiles(S.pending.splice(0), id);
+      S.sel = id; S.editing = null; await reload(); toast('Saved');
+    } catch (e) { err(e); }
   } },
-    h('h2', {}, isNew ? `New ${KINDS[it.kind].label.toLowerCase()}` : 'Edit item'), title, folder, dl, h('label', { class: 'chk' }, fav, ' Favorite'), rows,
-    h('button', { type: 'button', class: 'ghost', onclick: () => { it.fields.push(F('')); paintRows(); } }, icon('plus'), h('span', {}, 'Add field')), notes,
-    h('div', { class: 'btns' }, h('button', { class: 'primary', type: 'submit' }, 'Save'), h('button', { type: 'button', onclick: () => { editing = null; renderDetail(); } }, 'Cancel'), del));
+    h('h2', {}, isNew ? `New ${KINDS[it.kind].label.toLowerCase()}` : 'Edit item'), title, docChips, h('div', { class: 'two' }, folder, cat), dl, tl, tagBox,
+    h('div', { class: 'two' }, h('label', { class: 'dlabel' }, h('span', {}, 'Expires or rotate by'), exp), h('label', { class: 'chk' }, fav, ' Favorite')), rows,
+    h('button', { type: 'button', class: 'ghost', onclick: () => { it.fields.push(F('')); paintRows(); } }, icon('plus'), h('span', {}, 'Add field')),
+    h('h4', { class: 'edh' }, icon('image'), ' Photos and files'), files, fileIn,
+    h('h4', { class: 'edh' }, icon('note'), ' Notes'), notes,
+    h('div', { class: 'btns' }, h('button', { class: 'primary', type: 'submit' }, 'Save'), h('button', { type: 'button', onclick: () => { S.editing = null; S.pending = []; renderDetail(); } }, 'Cancel'),
+      h('button', { type: 'button', class: 'ghost', onclick: async () => {
+        const name = await ask('Save as template', 'Template name', it.title, 'Save', "Keeps this item's field layout (labels and types, no values) so you can start new items from it.");
+        if (!name) return;
+        S.settings.templates.push({ name, kind: it.kind, fields: it.fields.map(f => ({ label: f.label, kind: f.kind })) });
+        await saveSettings(); toast('Template saved');
+      } }, icon('sparkle'), h('span', {}, 'Save as template')), del));
+  form.addEventListener('paste', async e => {
+    const f = [...(e.clipboardData?.files ?? [])].find(x => x.type.startsWith('image/'));
+    if (f) { e.preventDefault(); await attachFiles([f], isNew ? null : it.id); await refreshAtts(); toast('Image added'); }
+  });
   put(detailEl, form);
   title.focus();
 }
@@ -503,7 +522,7 @@ async function renderAuth() {
   const tick = async () => {
     let live: Live[];
     try { live = await call<Live[]>('totp_all'); } catch { return; }
-    if (filter !== 'auth' || !grid.isConnected) return;
+    if (S.filter !== 'auth' || !grid.isConnected) return;
     const keys = live.map((l, i) => `${l.id}:${i}`);
     if (keys.join('|') !== sig) {
       sig = keys.join('|'); cards.clear();
@@ -522,74 +541,15 @@ async function renderAuth() {
   tick(); ticks.push(window.setInterval(tick, 1000));
 }
 
-const b64 = (f: File) => new Promise<string>((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = () => rej('could not read the file'); r.readAsDataURL(f); });
-
-function twofaDialog() {
-  const out = h('div', { class: 'found' });
-  const run = async (fn: () => Promise<Parsed>, btn?: HTMLElement) => {
-    btn?.classList.add('busy'); (btn as HTMLButtonElement | undefined)?.setAttribute('disabled', '');
-    try { found(await fn()); } catch (e) { err(e); }
-    btn?.classList.remove('busy'); btn?.removeAttribute('disabled');
-  };
-  const fromFile = (f: File) => run(async () => call<Parsed>('scan_image', { data: await b64(f) }));
-  const found = (p: Parsed) => {
-    const logins = sums.filter(s => !s.deleted && s.kind === 'login');
-    const rows = p.accounts.map(a => {
-      const match = logins.find(s => s.title.toLowerCase() === a.title.toLowerCase());
-      const on = h('input', { type: 'checkbox', checked: true, onchange: () => refresh() });
-      const mode = match ? h('select', {}, h('option', { value: 'merge' }, `Add to existing “${match.title}”`), h('option', { value: 'new' }, 'Create new login')) : null;
-      return { a, match, on, mode, el: h('label', { class: 'frow' }, on, avatar('login', a.title), h('div', { class: 't' }, h('b', {}, a.title), h('small', {}, a.account || a.uri.slice(0, 40))), mode) };
-    });
-    const add = h('button', { class: 'primary' }, '');
-    const refresh = () => { const n = rows.filter(r => r.on.checked).length; add.textContent = `Add ${n} account${n === 1 ? '' : 's'}`; add.toggleAttribute('disabled', n === 0); };
-    add.addEventListener('click', async () => {
-      add.setAttribute('disabled', '');
-      try {
-        const fresh: Item[] = []; let merged = 0, same = 0;
-        for (const r of rows.filter(r => r.on.checked)) {
-          if (r.match && r.mode?.value === 'merge') {
-            const it = await call<Item>('get_item', { id: r.match.id });
-            const t = it.fields.find(f => f.kind === 'totp');
-            if (t?.value === r.a.uri) { same++; continue; }
-            if (t) t.value = r.a.uri; else it.fields.push(F('One-time code', 'totp', r.a.uri));
-            await call('save_item', { item: it }); merged++;
-          } else fresh.push({ id: '', kind: 'login', title: r.a.title, folder: '', fields: [F('Username', 'text', r.a.account), F('One-time code', 'totp', r.a.uri)], notes: '', favorite: false, updated: 0, history: [], deleted: 0 });
-        }
-        const added = fresh.length ? await call<number>('import_items', { items: fresh }) : 0;
-        await reload();
-        toast([added && `${added} added`, merged && `${merged} updated`, (same + fresh.length - added) && `${same + fresh.length - added} already there`].filter(Boolean).join(', ') || 'Nothing to add');
-        document.querySelector('dialog.twofa')?.remove();
-      } catch (e) { err(e); add.removeAttribute('disabled'); }
-    });
-    put(out, h('div', { class: 'group' }, ...rows.map(r => r.el)), p.skipped ? h('p', { class: 'hint' }, `${p.skipped} entr${p.skipped === 1 ? 'y was' : 'ies were'} skipped (counter-based codes are not supported, or the data was unreadable).`) : null,
-      h('p', { class: 'hint' }, 'Delete any screenshot of an export QR code afterwards: it contains every secret.'), add);
-    refresh();
-  };
-  const imgIn = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: () => { const f = imgIn.files?.[0]; if (f) fromFile(f); imgIn.value = ''; } });
-  const txt = h('textarea', { rows: 3, placeholder: '…or paste otpauth:// or otpauth-migration:// links here', spellcheck: false });
-  const screen = h('button', { class: 'primary', onclick: () => run(() => call<Parsed>('scan_screen'), screen) }, icon('scan'), h('span', {}, 'Scan my screen'));
-  const d = dialog(close => [h('h3', {}, 'Import 2FA codes'),
-    h('p', { class: 'hint' }, 'Works with Google Authenticator (menu > Transfer accounts > Export), the QR code a site shows when you turn on 2FA, and text links.'),
-    h('div', { class: 'btns' }, screen, h('button', { onclick: () => imgIn.click() }, icon('upload'), h('span', {}, 'Open QR image…')), imgIn),
-    h('p', { class: 'hint' }, 'Vault hides itself while scanning, so show the QR code first. A screenshot from your phone works too: open the image here or press Ctrl+V to paste it.'),
-    txt, h('button', { onclick: () => txt.value.trim() && run(async () => { const p = await call<Parsed>('parse_2fa', { text: txt.value }); if (!p.accounts.length && !p.skipped) throw 'No 2FA links found in that text.'; return p; }) }, 'Read pasted text'),
-    out, h('button', { onclick: close }, 'Close')], 'twofa');
-  d.addEventListener('paste', e => {
-    const f = [...(e.clipboardData?.files ?? [])].find(x => x.type.startsWith('image/'));
-    if (f) { e.preventDefault(); fromFile(f); }
-  });
-}
-
 // ---------- security center ----------
 async function renderSecurity() {
   put(detailEl, h('p', { class: 'hint pad' }, 'Checking your passwords…'));
   let a: Audit;
   try { a = await call<Audit>('security_audit'); } catch (e) { return err(e); }
-  if (filter !== 'security') return;
-  const open = openItem;
-  const section = (title: string, ic: string, refs: Ref[], tip: string) => h('section', { class: 'sect' },
-    h('h3', {}, icon(ic), ` ${title} `, h('span', { class: 'n' }, String(refs.length))),
-    refs.length ? h('div', { class: 'group' }, ...refs.map(r => h('button', { class: 'row flat', onclick: () => open(r.id) }, h('div', { class: 't' }, h('b', {}, r.title), h('small', {}, r.note)), icon('edit')))) : h('p', { class: 'hint ok' }, icon('check'), ' ' + tip));
+  if (S.filter !== 'security') return;
+  const section = (title: string, ic: string, refs: Ref[], tip: string, flag: string) => h('section', { class: 'sect' },
+    h('h3', {}, icon(ic), ` ${title} `, h('span', { class: 'n' }, String(refs.length)), refs.length ? h('button', { class: 'linkbtn', onclick: () => go('flag:' + flag) }, 'View in list') : null),
+    refs.length ? h('div', { class: 'group' }, ...refs.map(r => h('button', { class: 'row flat', onclick: () => openItem(r.id) }, h('div', { class: 't' }, h('b', {}, r.title), h('small', {}, r.note)), icon('edit')))) : h('p', { class: 'hint ok' }, icon('check'), ' ' + tip));
   const ring = fromHtml(`<svg class="score" viewBox="0 0 120 120"><circle class="bg" cx="60" cy="60" r="52"/><circle class="fg ${a.score >= 80 ? 'strong' : a.score >= 50 ? 'fair' : 'weak'}" cx="60" cy="60" r="52"/><text x="60" y="68" text-anchor="middle">${a.score}</text></svg>`);
   (ring.querySelector('.fg') as SVGElement).style.strokeDashoffset = String(326.7 * (1 - a.score / 100));
   const breaches = h('div', { class: 'sect' });
@@ -599,114 +559,38 @@ async function renderSecurity() {
     try {
       const found = await call<Ref[]>('breach_check');
       put(breaches, h('h3', {}, icon('alert'), ' Found in known breaches ', h('span', { class: 'n' }, String(found.length))),
-        found.length ? h('div', { class: 'group' }, ...found.map(r => h('button', { class: 'row flat', onclick: () => open(r.id) }, h('div', { class: 't' }, h('b', {}, r.title), h('small', {}, r.note)), icon('edit')))) : h('p', { class: 'hint ok' }, icon('check'), ' None of your passwords were found.'));
+        found.length ? h('div', { class: 'group' }, ...found.map(r => h('button', { class: 'row flat', onclick: () => openItem(r.id) }, h('div', { class: 't' }, h('b', {}, r.title), h('small', {}, r.note)), icon('edit')))) : h('p', { class: 'hint ok' }, icon('check'), ' None of your passwords were found.'));
     } catch (e) { err(e); runBreach.disabled = false; runBreach.classList.remove('busy'); }
   });
   put(breaches, h('h3', {}, icon('globe'), ' Breach check'), h('p', { class: 'hint' }, 'Optional and online. Only the first 5 characters of a hash of each password are sent to haveibeenpwned.com; your passwords never leave this PC.'), runBreach);
   put(detailEl, h('div', { class: 'secwrap' },
     h('div', { class: 'sechead' }, ring, h('div', {}, h('h2', {}, 'Security center'), h('p', { class: 'hint' }, a.total ? `${a.total} login${a.total === 1 ? '' : 's'} checked on this PC.` : 'Add logins to see how healthy your passwords are.'))),
-    section('Weak passwords', 'alert', a.weak, 'No weak passwords.'), section('Reused passwords', 'copy', a.reused, 'No reused passwords.'),
-    section('Old passwords', 'clock', a.old, 'Nothing older than a year.'), section('Sites without HTTPS', 'globe', a.insecure, 'Every saved site uses HTTPS.'), breaches));
-}
-
-// ---------- dialogs ----------
-function dialog(content: (close: () => void) => (Node | null | false)[], cls = '') {
-  const d = h('dialog', { class: cls });
-  const close = () => { d.close(); d.remove(); };
-  d.addEventListener('close', () => d.remove());
-  d.addEventListener('click', e => { if (e.target === d) close(); });
-  d.append(h('div', { class: 'dlg' }, ...(content(close).filter(Boolean) as Node[])));
-  document.body.append(d);
-  d.showModal();
-  return d;
-}
-
-function newItem(k: Kind) {
-  sel = null;
-  if (['security', 'trash', 'auth'].includes(filter)) go('all');
-  editing = { id: '', kind: k, title: '', folder: filter.startsWith('folder:') ? filter.slice(7) : '', fields: TEMPLATES[k](), notes: '', favorite: false, updated: 0, history: [], deleted: 0 };
-  renderList(); renderDetail();
-}
-
-function newDialog() {
-  dialog(close => [h('h3', {}, 'New item'), h('div', { class: 'tiles' },
-    ...KIND_ORDER.map(k => h('button', { class: 'tile', onclick: () => { close(); newItem(k); } }, icon(KINDS[k].icon), h('span', {}, h('b', {}, KINDS[k].label), h('small', {}, KINDS[k].desc))))),
-    h('button', { onclick: close }, 'Cancel')]);
-}
-
-let genOpts = { len: 20, lower: true, upper: true, digits: true, symbols: true };
-function genDialog(use?: (pw: string) => void) {
-  const m = meter();
-  const out = h('input', { readOnly: true, class: 'mono' });
-  const run = async () => { try { out.value = await call<string>('generate', genOpts); m.update(out.value); } catch (e) { out.value = ''; err(e); } };
-  const lab = h('label', {}, `Length ${genOpts.len}`);
-  const len = h('input', { type: 'range', min: 8, max: 64, value: genOpts.len, oninput: () => { genOpts.len = +len.value; lab.textContent = `Length ${genOpts.len}`; run(); } });
-  const box = (k: 'lower' | 'upper' | 'digits' | 'symbols', text: string) => {
-    const c = h('input', { type: 'checkbox', checked: genOpts[k], onchange: () => { genOpts[k] = c.checked; run(); } });
-    return h('label', { class: 'chk' }, c, ' ' + text);
-  };
-  dialog(close => [h('h3', {}, 'Password generator'), out, m.el, lab, len, h('div', { class: 'opts' }, box('lower', 'a-z'), box('upper', 'A-Z'), box('digits', '0-9'), box('symbols', 'Symbols')),
-    h('div', { class: 'btns' }, h('button', { onclick: run }, icon('restore'), h('span', {}, 'Regenerate')), h('button', { onclick: () => out.value && copyText(out.value) }, icon('copy'), h('span', {}, 'Copy')),
-      use ? h('button', { class: 'primary', onclick: () => { if (out.value) { use(out.value); close(); } } }, 'Use') : null, h('button', { onclick: close }, 'Close'))]);
-  run();
-}
-
-function masterDialog() {
-  const a = pwField('m0', 'Current master password'), b = pwField('m1', 'New master password (10+ characters)'), c = pwField('m2', 'Repeat new password');
-  const m = meter();
-  b.input.addEventListener('input', () => m.update(b.input.value));
-  const msg = h('p', { class: 'hint' }, 'Older backups in the Vault folder still open with the old password.');
-  dialog(close => [h('h3', {}, 'Change master password'), a.wrap, b.wrap, m.el, c.wrap, msg,
-    h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: async () => {
-      if (b.input.value !== c.input.value) { msg.textContent = 'The new passwords differ.'; return; }
-      try { await call('change_password', { oldPassword: a.input.value, newPassword: b.input.value }); close(); toast('Master password changed'); } catch (e) { msg.textContent = String(e); }
-    } }, 'Change'), h('button', { onclick: close }, 'Cancel'))]);
-}
-
-async function settingsDialog() {
-  const dir = await call<string>('backup_dir');
-  const { quick } = await call<{ quick: boolean }>('status');
-  const choose = (label: string, opts: [number, string][], cur: number, set: (v: number) => void) => {
-    const s = h('select', { onchange: async () => { set(+s.value); try { await call('set_settings', { settings }); resetIdle(); toast('Saved'); } catch (e) { err(e); } } },
-      ...opts.map(([v, n]) => h('option', { value: String(v), selected: v === cur }, n)));
-    return h('label', { class: 'setrow' }, h('span', {}, label), s);
-  };
-  dialog(close => [h('h3', {}, 'Settings'),
-    choose('Lock after being idle', [[1, '1 minute'], [2, '2 minutes'], [5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '1 hour'], [0, 'Never']], settings.autolock_min, v => settings.autolock_min = v),
-    choose('Clear the clipboard after', [[10, '10 seconds'], [20, '20 seconds'], [30, '30 seconds'], [60, '1 minute'], [0, 'Never']], settings.clip_secs, v => settings.clip_secs = v),
-    (() => {
-      const c = h('input', { type: 'checkbox', checked: quick, id: 'quickbox', onchange: async () => {
-        try { await call(c.checked ? 'quick_enable' : 'quick_disable'); toast(c.checked ? 'Vault will open automatically on this PC' : 'Vault will ask for the master password'); } catch (e) { c.checked = !c.checked; err(e); }
-      } });
-      return h('label', { class: 'chk stay' }, c, h('span', {}, 'Unlock automatically on this PC', h('small', {}, 'Opens straight into the vault when you start the app, and the lock screen needs one click. Anyone using this Windows account can open it.')));
-    })(),
-    h('div', { class: 'setrow col2' }, h('span', {}, 'Automatic backups (one per day, newest 14)'), h('code', {}, dir), h('button', { onclick: () => call('open_backups').catch(err) }, icon('folder'), h('span', {}, 'Open backup folder'))),
-    h('button', { onclick: async () => {
-      const path = await save({ defaultPath: 'vault-backup.bin', filters: [{ name: 'Vault backup', extensions: ['bin'] }] });
-      if (path) { try { await call('export_backup', { path }); toast('Encrypted backup saved'); } catch (e) { err(e); } }
-    } }, icon('upload'), h('span', {}, 'Export encrypted backup…')),
-    h('div', { class: 'keys' }, h('b', {}, 'Shortcuts'), ...([['Ctrl+Alt+K', 'Quick find from anywhere'], ['Ctrl+K', 'Quick find'], ['Ctrl+N', 'New item'], ['Ctrl+Shift+C', 'Copy password'], ['Ctrl+Shift+U', 'Copy username'], ['Ctrl+Shift+T', 'Copy one-time code'], ['Ctrl+L', 'Lock'], ['/', 'Search'], ['↑ ↓', 'Browse the list']] as [string, string][]).map(([k, d]) => h('div', {}, h('kbd', {}, k), h('span', {}, d)))),
-    h('button', { onclick: close }, 'Close')]);
+    section('Expiring or expired', 'clock', a.expiring, 'Nothing is due soon.', 'expiring'), section('Weak passwords', 'alert', a.weak, 'No weak passwords.', 'weak'), section('Reused passwords', 'copy', a.reused, 'No reused passwords.', 'reused'),
+    section('Old passwords', 'clock', a.old, 'Nothing older than a year.', 'old'), section('Sites without HTTPS', 'globe', a.insecure, 'Every saved site uses HTTPS.', 'http'), breaches));
 }
 
 // ---------- quick find ----------
 function palette() {
-  if (!mainActive || document.querySelector('dialog.pal')) return;
+  if (!S.mainActive || document.querySelector('dialog.pal')) return;
   type Entry = { label: string; sub: string; ic: string; run: () => void; pw?: () => void };
-  const open = openItem;
   const actions: Entry[] = [
-    { label: 'New login', sub: 'Action', ic: 'plus', run: () => newItem('login') }, { label: 'Password generator', sub: 'Action', ic: 'dice', run: () => genDialog() },
+    { label: 'New login', sub: 'Action', ic: 'plus', run: () => newItem('login') }, { label: 'New item…', sub: 'Action', ic: 'plus', run: () => newDialog(newItem) }, { label: 'Password generator', sub: 'Action', ic: 'dice', run: () => genDialog() },
     { label: 'Authenticator codes', sub: 'Action', ic: 'timer', run: () => go('auth') }, { label: 'Import 2FA codes', sub: 'Action', ic: 'scan', run: twofaDialog },
     { label: 'Security center', sub: 'Action', ic: 'shieldcheck', run: () => go('security') }, { label: 'Settings', sub: 'Action', ic: 'settings', run: settingsDialog }, { label: 'Lock vault', sub: 'Action', ic: 'lock', run: lockNow }];
   const q = h('input', { placeholder: 'Search items or type a command…', autocomplete: 'off', spellcheck: false });
   const res = h('div', { class: 'pres' });
-  let list: Entry[] = [], cur = 0;
-  const draw = () => {
-    const t = q.value.toLowerCase();
-    const items: Entry[] = sums.filter(s => !s.deleted && (!t || [s.title, s.sub, s.folder].some(x => x.toLowerCase().includes(t)))).sort((a, b) => a.title.localeCompare(b.title)).slice(0, 7).map(s => ({
-      label: s.title, sub: s.sub || KINDS[s.kind].label, ic: KINDS[s.kind].icon, run: () => open(s.id),
+  let list: Entry[] = [], cur = 0, seq = 0;
+  const draw = async () => {
+    const t = q.value, n = ++seq;
+    let ids: string[] | null = null;
+    if (t.trim()) { try { ids = await call<string[]>('search', { query: t, trash: false }); } catch { ids = []; } }
+    if (n !== seq) return;
+    const byId = new Map(S.sums.map(s => [s.id, s]));
+    const hits = (ids ?? S.sums.filter(s => !s.deleted).sort(SORTS.name).map(s => s.id)).map(id => byId.get(id)).filter((s): s is Sum => !!s).slice(0, 7);
+    const items: Entry[] = hits.map(s => ({
+      label: s.title, sub: s.sub || s.domain || KINDS[s.kind].label, ic: KINDS[s.kind].icon, run: () => openItem(s.id),
       pw: async () => { const it = await call<Item>('get_item', { id: s.id }); const p = it.fields.find(f => f.label === 'Password')?.value; if (p) copyText(p); else toast('This item has no password', true); } }));
-    list = [...items, ...actions.filter(a => !t || a.label.toLowerCase().includes(t))];
+    list = [...items, ...actions.filter(a => !t.trim() || a.label.toLowerCase().includes(t.toLowerCase()))];
     cur = Math.min(cur, Math.max(0, list.length - 1));
     put(res, ...(list.length ? list.map((e, i) => h('button', { class: 'pr' + (i === cur ? ' on' : ''), onclick: () => { d.remove(); e.run(); }, onmousemove: () => { if (cur !== i) { cur = i; res.querySelectorAll('.pr').forEach((x, j) => x.classList.toggle('on', j === cur)); } } },
       icon(e.ic), h('b', {}, e.label), h('small', {}, e.sub))) : [h('p', { class: 'hint pad' }, 'Nothing found.')]));
@@ -714,21 +598,21 @@ function palette() {
   const d = dialog(() => [q, res, h('small', { class: 'hint pfoot' }, 'Enter opens · Ctrl+Enter copies the password · Esc closes')], 'pal');
   q.addEventListener('input', () => { cur = 0; draw(); });
   q.addEventListener('keydown', e => {
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); cur = Math.max(0, Math.min(list.length - 1, cur + (e.key === 'ArrowDown' ? 1 : -1))); draw(); res.querySelector('.pr.on')?.scrollIntoView({ block: 'nearest' }); }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); cur = Math.max(0, Math.min(list.length - 1, cur + (e.key === 'ArrowDown' ? 1 : -1))); res.querySelectorAll('.pr').forEach((x, j) => x.classList.toggle('on', j === cur)); res.querySelector('.pr.on')?.scrollIntoView({ block: 'nearest' }); }
     else if (e.key === 'Enter' && list[cur]) { e.preventDefault(); const en = list[cur]; d.remove(); if (e.ctrlKey && en.pw) en.pw(); else en.run(); }
   });
   draw(); q.focus();
 }
 
 async function copyField(label: string) {
-  if (!sel || editing) return;
-  try { const it = await call<Item>('get_item', { id: sel }); const v = it.fields.find(f => f.label === label)?.value; if (v) copyText(v); else toast(`This item has no ${label.toLowerCase()}`, true); } catch (e) { err(e); }
+  if (!S.sel || S.editing) return;
+  try { const it = await call<Item>('get_item', { id: S.sel }); const v = it.fields.find(f => f.label === label)?.value; if (v) copyText(v); else toast(`This item has no ${label.toLowerCase()}`, true); } catch (e) { err(e); }
 }
 
 async function copyCode() {
-  if (!sel || editing) return;
+  if (!S.sel || S.editing) return;
   try {
-    const t = (await call<Item>('get_item', { id: sel })).fields.find(f => f.kind === 'totp' && f.value);
+    const t = (await call<Item>('get_item', { id: S.sel })).fields.find(f => f.kind === 'totp' && f.value);
     if (!t) return toast('This item has no one-time code', true);
     await copyText((await call<{ code: string }>('totp', { secret: t.value })).code);
   } catch (e) { err(e); }
@@ -736,13 +620,13 @@ async function copyCode() {
 
 // ---------- keyboard ----------
 document.addEventListener('keydown', e => {
-  if (!mainActive) return;
+  if (!S.mainActive) return;
   const k = e.key.toLowerCase();
   const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName);
   const modal = !!document.querySelector('dialog[open]');
   if (e.ctrlKey && !e.shiftKey && !e.altKey && k === 'k') { e.preventDefault(); palette(); }
   else if (modal) return;
-  else if (e.ctrlKey && !e.shiftKey && k === 'n') { e.preventDefault(); newDialog(); }
+  else if (e.ctrlKey && !e.shiftKey && k === 'n') { e.preventDefault(); newDialog(newItem); }
   else if (e.ctrlKey && !e.shiftKey && k === 'l') { e.preventDefault(); lockNow(); }
   else if (e.ctrlKey && e.shiftKey && k === 'c') { e.preventDefault(); copyField('Password'); }
   else if (e.ctrlKey && e.shiftKey && k === 'u') { e.preventDefault(); copyField('Username'); }
@@ -750,11 +634,14 @@ document.addEventListener('keydown', e => {
   else if (e.key === '/' && !typing) { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && (!typing || e.target === searchEl)) { e.preventDefault(); moveSel(e.key === 'ArrowDown' ? 1 : -1); }
   else if (e.key === 'Escape') {
-    if (editing) { editing = null; renderDetail(); }
-    else if (query) { query = ''; searchEl.value = ''; renderList(true); }
+    if (S.bulk) { S.bulk = false; S.picked.clear(); renderList(); }
+    else if (S.editing) { S.editing = null; S.pending = []; renderDetail(); }
+    else if (S.query) { S.query = ''; searchEl.value = ''; runSearch(); }
   }
 });
-for (const ev of ['mousemove', 'keydown', 'click']) document.addEventListener(ev, () => { if (mainActive) resetIdle(); }, { passive: true });
+for (const ev of ['mousemove', 'keydown', 'click']) document.addEventListener(ev, () => { if (S.mainActive) resetIdle(); }, { passive: true });
 listen('quick-search', () => palette());
+listen('vault-locked', () => { if (S.mainActive) showLock(false); });
+listen('vault-synced', () => { if (S.mainActive && !S.editing) reload(); });
 
 showLock(true).catch(e => { app.textContent = String(e); });

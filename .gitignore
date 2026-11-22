@@ -15,3 +15,4 @@ pc-tools/*.cmd
 *.log
 src-tauri/icons/android
 src-tauri/icons/ios
+pc-tools/qr/cam.mjpeg

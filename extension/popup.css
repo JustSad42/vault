@@ -1,0 +1,13 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; font: 13px/1.4 "Segoe UI", system-ui, sans-serif; }
+body { margin: 0; width: 330px; background: #0d1018; color: #eceff6; }
+header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; background: linear-gradient(135deg, #7b8cff33, #a06bff22); border-bottom: 1px solid #2a3042; }
+header .logo { width: 28px; height: 28px; border-radius: 9px; background: linear-gradient(135deg, #7b8cff, #a06bff); display: grid; place-items: center; }
+header b { font-size: 15px; flex: 1; } main { padding: 12px 14px; display: grid; gap: 10px; }
+.hint { color: #8b93a8; margin: 0; } .bad { color: #ff6b7e; } .ok { color: #4cd6a0; }
+input { background: #1a1e2b; border: 1px solid #2a3042; border-radius: 10px; color: inherit; padding: 8px 12px; width: 100%; letter-spacing: .2em; font-size: 16px; text-align: center; }
+button { background: #1c2130; border: 1px solid #2a3042; border-radius: 10px; color: inherit; padding: 7px 12px; cursor: pointer; } button:hover { border-color: #7b8cff; }
+button.p { background: linear-gradient(135deg, #7b8cff, #a06bff); border: 0; color: #fff; font-weight: 600; }
+.login { display: flex; gap: 8px; align-items: center; background: #151822; border: 1px solid #2a3042; border-radius: 12px; padding: 8px 10px; }
+.login .t { flex: 1; min-width: 0; } .login b, .login small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .login small { color: #8b93a8; }
+label { display: flex; gap: 8px; align-items: center; color: #8b93a8; } label input { width: auto; letter-spacing: 0; font-size: 13px; }

@@ -4,6 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{aead::{Aead, Payload}, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 use zeroize::Zeroizing;
 
@@ -13,17 +14,27 @@ const NONCE: usize = 24;
 const KEEP_BACKUPS: usize = 14;
 const TRASH_DAYS: u64 = 30;
 const KEEP_HISTORY: usize = 20;
+const KEEP_VERSIONS: usize = 25;
+const MAX_ATT: usize = 25 * 1024 * 1024;
+const RMAGIC: &[u8; 4] = b"VRC1";
 
 #[derive(Clone, Copy)]
 pub struct Kdf { pub m: u32, pub t: u32, pub p: u32 }
 /// 64 MiB, 3 passes: about 0.3 s per unlock on a desktop.
 pub const KDF: Kdf = Kdf { m: 65536, t: 3, p: 1 };
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct Field { pub label: String, pub value: String, pub kind: String } // kind: text | secret | totp
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Hist { pub label: String, pub value: String, pub at: u64 }
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Att { pub id: String, pub name: String, pub size: u64 }
+
+/// A past state of an item: everything you can edit, as it was before a change.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ItemVersion { pub at: u64, pub title: String, pub folder: String, pub tags: Vec<String>, pub notes: String, pub expires: String, pub category: String, pub fields: Vec<Field> }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Item {
@@ -37,18 +48,55 @@ pub struct Item {
     #[serde(default)] pub updated: u64,
     #[serde(default)] pub history: Vec<Hist>, // earlier values of secret fields, newest last
     #[serde(default)] pub deleted: u64,       // 0 = alive, else when it went to the trash
+    #[serde(default)] pub tags: Vec<String>,
+    #[serde(default)] pub expires: String,    // YYYY-MM-DD or empty
+    #[serde(default)] pub attachments: Vec<Att>, // files live encrypted in attachments/<id>.bin
+    #[serde(default)] pub category: String,   // empty = automatic
+    #[serde(default)] pub versions: Vec<ItemVersion>, // newest last
+}
+
+impl Item {
+    fn snapshot(&self) -> ItemVersion {
+        ItemVersion { at: self.updated, title: self.title.clone(), folder: self.folder.clone(), tags: self.tags.clone(), notes: self.notes.clone(), expires: self.expires.clone(), category: self.category.clone(), fields: self.fields.clone() }
+    }
+    fn same_content(&self, o: &Item) -> bool {
+        (&self.title, &self.folder, &self.tags, &self.notes, &self.expires, &self.category, &self.fields) == (&o.title, &o.folder, &o.tags, &o.notes, &o.expires, &o.category, &o.fields)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Settings {
-    #[serde(default = "d_auto")] pub autolock_min: u32, // 0 = never
-    #[serde(default = "d_clip")] pub clip_secs: u64,    // 0 = never clear
-}
-fn d_auto() -> u32 { 5 }
-fn d_clip() -> u64 { 20 }
-impl Default for Settings { fn default() -> Self { Settings { autolock_min: d_auto(), clip_secs: d_clip() } } }
+pub struct Paired { pub name: String, pub hash: String, pub created: u64 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TplField { pub label: String, pub kind: String }
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Template { pub name: String, pub kind: String, pub fields: Vec<TplField> }
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Settings {
+    pub autolock_min: u32, // 0 = never
+    pub clip_secs: u64,    // 0 = never clear
+    pub accent: String,
+    pub theme: String, // auto | dark | light
+    pub templates: Vec<Template>,
+    pub lock_on_windows_lock: bool,
+    pub tray: bool,          // keep running in the tray when the window is closed
+    pub check_updates: bool,
+    pub sync_url: String,
+    pub sync_token: String,      // never sent to the page
+    pub recovery_phrase: String, // never sent to the page except by recovery_phrase
+    pub paired: Vec<Paired>,     // browser extensions allowed to talk to the app (token hashes)
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { autolock_min: 5, clip_secs: 20, accent: "indigo".into(), theme: "auto".into(), templates: vec![], lock_on_windows_lock: true, tray: false,
+            check_updates: true, sync_url: String::new(), sync_token: String::new(), recovery_phrase: String::new(), paired: vec![] }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Data {
     pub items: Vec<Item>,
     #[serde(default)] pub settings: Settings,
@@ -117,6 +165,67 @@ fn ymd(z: i64) -> (i64, i64, i64) { // days since 1970-01-01 -> civil date
     (yoe + era * 400 + (m <= 2) as i64, m, d)
 }
 
+/// Inverse of `ymd`: civil date -> days since 1970-01-01.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - (m <= 2) as i64;
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+}
+
+/// "YYYY-MM-DD" -> days since 1970-01-01.
+pub fn parse_date(s: &str) -> Option<i64> {
+    let mut it = s.trim().split('-');
+    let (y, m, d): (i64, i64, i64) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) { return None; }
+    Some(days_from_civil(y, m, d))
+}
+
+fn recovery_key(phrase: &str) -> Zeroizing<[u8; 32]> {
+    let norm: String = phrase.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase();
+    let mut h = Sha256::new();
+    h.update(b"vault recovery v1");
+    h.update(norm.as_bytes());
+    Zeroizing::new(h.finalize().into())
+}
+
+/// 160 random bits as 8 groups of 4 base32 characters.
+pub fn new_phrase() -> String {
+    let mut b = [0u8; 20];
+    OsRng.fill_bytes(&mut b);
+    data_encoding::BASE32_NOPAD.encode(&b).as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
+}
+
+/// Puts a chosen backup file in place of the vault (keeping a safety copy of the current one).
+pub fn restore_file(vault: &Path, from: &Path) -> Result<(), String> {
+    let b = fs::read(from).map_err(|e| e.to_string())?;
+    read_header(&b)?;
+    if from == vault { return Err("that is the current vault".into()); }
+    if let (true, Some(dir)) = (vault.exists(), vault.parent().map(|d| d.join("backups"))) {
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let (y, m, d) = ymd((now() / 86400) as i64);
+        fs::copy(vault, dir.join(format!("pre-restore-{y:04}-{m:02}-{d:02}-{}.bin", now() % 86400))).map_err(|e| e.to_string())?;
+    }
+    let tmp = vault.with_extension("tmp");
+    fs::write(&tmp, &b).and_then(|_| fs::rename(&tmp, vault)).map_err(|e| e.to_string())
+}
+
+/// Decrypts vault-file bytes with a key (used by sync to look inside the server's copy).
+pub fn read_data(bytes: &[u8], key: &[u8; 32]) -> Result<Data, String> { read_header(bytes)?; decrypt(key, bytes) }
+
+/// Encrypts `data` with the same key, salt and cost as the vault file in `like`, so the result opens with the same master password.
+pub fn reseal(like: &[u8], key: &[u8; 32], data: &Data) -> Result<Vec<u8>, String> { let (kdf, salt) = read_header(like)?; seal(key, &salt, kdf, data) }
+
+/// Two copies of one vault that were changed on different PCs: every item once, the more recently changed copy wins; settings stay local.
+pub fn merge_data(local: Data, remote: Data) -> Data {
+    let mut by_id: std::collections::HashMap<String, Item> = remote.items.into_iter().map(|i| (i.id.clone(), i)).collect();
+    for l in local.items { match by_id.get(&l.id) { Some(r) if r.updated > l.updated => {} _ => { by_id.insert(l.id.clone(), l); } } }
+    let mut items: Vec<Item> = by_id.into_values().collect();
+    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
+    Data { items, settings: local.settings }
+}
+
 pub struct Session { key: Zeroizing<[u8; 32]>, salt: [u8; 16], kdf: Kdf, pub data: Data, path: PathBuf }
 
 impl Session {
@@ -159,7 +268,8 @@ impl Session {
         let (y, m, d) = ymd((now() / 86400) as i64);
         let f = dir.join(format!("vault-{y:04}-{m:02}-{d:02}.bin"));
         if !f.exists() { let _ = fs::copy(&self.path, &f); }
-        let mut all: Vec<PathBuf> = fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        let mut all: Vec<PathBuf> = fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("vault-"))).collect(); // pre-restore copies are never pruned
         all.sort();
         while all.len() > KEEP_BACKUPS { let _ = fs::remove_file(all.remove(0)); }
     }
@@ -171,7 +281,9 @@ impl Session {
         let tmp = self.path.with_extension("tmp");
         let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
         f.write_all(&bytes).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        self.gc_attachments();
+        Ok(())
     }
 
     pub fn upsert(&mut self, mut item: Item) -> Result<String, String> {
@@ -181,6 +293,8 @@ impl Session {
             item.id = new_id();
             item.history.clear();
             item.deleted = 0;
+            item.attachments.clear();
+            item.versions.clear();
             self.data.items.push(item.clone());
         } else {
             let slot = self.data.items.iter_mut().find(|i| i.id == item.id).ok_or("item not found")?;
@@ -194,6 +308,11 @@ impl Session {
             hist.drain(..hist.len().saturating_sub(KEEP_HISTORY));
             item.history = hist;
             item.deleted = slot.deleted;
+            item.attachments = slot.attachments.clone();
+            let mut versions = slot.versions.clone();
+            if !slot.same_content(&item) { versions.push(slot.snapshot()); }
+            versions.drain(..versions.len().saturating_sub(KEEP_VERSIONS));
+            item.versions = versions;
             *slot = item.clone();
         }
         self.save()?;
@@ -237,12 +356,152 @@ impl Session {
 
     pub fn change_password(&mut self, old: &str, new: &str, kdf: Kdf) -> Result<(), String> {
         if *derive(old, &self.salt, self.kdf)? != *self.key { return Err("current password is wrong".into()); }
+        self.set_password(new, kdf)
+    }
+
+    /// New salt and key; the recovery file (if any) is re-wrapped so the recovery key keeps working.
+    fn set_password(&mut self, new: &str, kdf: Kdf) -> Result<(), String> {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
         let key = derive(new, &salt, kdf)?;
         let prev = (std::mem::replace(&mut self.key, key), std::mem::replace(&mut self.salt, salt), std::mem::replace(&mut self.kdf, kdf));
         if let Err(e) = self.save() { (self.key, self.salt, self.kdf) = prev; return Err(e); }
+        let phrase = self.data.settings.recovery_phrase.clone();
+        if !phrase.is_empty() { self.recovery_write(&phrase)?; }
         Ok(())
+    }
+
+    fn recovery_write(&self, phrase: &str) -> Result<(), String> {
+        let rk = recovery_key(phrase);
+        let mut nonce = [0u8; NONCE];
+        OsRng.fill_bytes(&mut nonce);
+        let ct = XChaCha20Poly1305::new(Key::from_slice(&*rk)).encrypt(XNonce::from_slice(&nonce), Payload { msg: &self.key[..], aad: RMAGIC })
+            .map_err(|_| "encryption failed".to_string())?;
+        let mut out = RMAGIC.to_vec();
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        let to = self.path.with_file_name("recovery.bin");
+        let tmp = to.with_extension("tmp");
+        fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &to)).map_err(|e| e.to_string())
+    }
+
+    /// Creates (or replaces) the recovery key and returns it to show once.
+    pub fn enable_recovery(&mut self) -> Result<String, String> {
+        let phrase = new_phrase();
+        self.recovery_write(&phrase)?;
+        self.data.settings.recovery_phrase = phrase.clone();
+        self.save()?;
+        Ok(phrase)
+    }
+
+    /// Forgot the master password: the recovery key opens the vault and a new master password is set.
+    pub fn recover(path: &Path, phrase: &str, new_pw: &str, kdf: Kdf) -> Result<Self, String> {
+        let b = fs::read(path.with_file_name("recovery.bin")).map_err(|_| "no recovery key was set up for this vault".to_string())?;
+        if b.len() < 4 + NONCE + 16 || &b[..4] != RMAGIC { return Err("the recovery file is damaged".into()); }
+        let rk = recovery_key(phrase);
+        let key = XChaCha20Poly1305::new(Key::from_slice(&*rk)).decrypt(XNonce::from_slice(&b[4..4 + NONCE]), Payload { msg: &b[4 + NONCE..], aad: RMAGIC })
+            .map_err(|_| "that recovery key is wrong".to_string())?;
+        let key: [u8; 32] = key.try_into().map_err(|_| "the recovery file is damaged".to_string())?;
+        let mut s = Self::open_with_key(path, &key)?;
+        s.set_password(new_pw, kdf)?;
+        Ok(s)
+    }
+
+    // ---- attachments: each file is its own XChaCha20-Poly1305 blob under the vault key, id as AAD
+    fn att_dir(&self) -> PathBuf { self.path.with_file_name("attachments") }
+
+    pub fn att_add(&mut self, item_id: &str, name: &str, bytes: &[u8]) -> Result<Att, String> {
+        if bytes.len() > MAX_ATT { return Err("files can be at most 25 MB".into()); }
+        if !self.data.items.iter().any(|i| i.id == item_id) { return Err("item not found".into()); }
+        let id = new_id();
+        let mut nonce = [0u8; NONCE];
+        OsRng.fill_bytes(&mut nonce);
+        let ct = XChaCha20Poly1305::new(Key::from_slice(&*self.key)).encrypt(XNonce::from_slice(&nonce), Payload { msg: bytes, aad: id.as_bytes() })
+            .map_err(|_| "encryption failed".to_string())?;
+        fs::create_dir_all(self.att_dir()).map_err(|e| e.to_string())?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        fs::write(self.att_dir().join(format!("{id}.bin")), out).map_err(|e| e.to_string())?;
+        let att = Att { id, name: name.rsplit(['\\', '/']).next().unwrap_or(name).to_string(), size: bytes.len() as u64 };
+        let it = self.data.items.iter_mut().find(|i| i.id == item_id).unwrap();
+        it.attachments.push(att.clone());
+        it.updated = now();
+        self.save()?;
+        Ok(att)
+    }
+
+    pub fn att_get(&self, att_id: &str) -> Result<Vec<u8>, String> {
+        // only ids that an item references: no path tricks
+        if !self.data.items.iter().any(|i| i.attachments.iter().any(|a| a.id == att_id)) { return Err("attachment not found".into()); }
+        let b = fs::read(self.att_dir().join(format!("{att_id}.bin"))).map_err(|e| e.to_string())?;
+        if b.len() < NONCE + 16 { return Err("attachment is damaged".into()); }
+        XChaCha20Poly1305::new(Key::from_slice(&*self.key)).decrypt(XNonce::from_slice(&b[..NONCE]), Payload { msg: &b[NONCE..], aad: att_id.as_bytes() })
+            .map_err(|_| "attachment is damaged".to_string())
+    }
+
+    pub fn att_remove(&mut self, item_id: &str, att_id: &str) -> Result<(), String> {
+        let it = self.data.items.iter_mut().find(|i| i.id == item_id).ok_or("item not found")?;
+        it.attachments.retain(|a| a.id != att_id);
+        it.updated = now();
+        self.save()
+    }
+
+    /// Deletes attachment files no item refers to any more (permanent delete, emptied trash).
+    fn gc_attachments(&self) {
+        let keep: std::collections::HashSet<String> = self.data.items.iter().flat_map(|i| i.attachments.iter().map(|a| format!("{}.bin", a.id))).collect();
+        for e in fs::read_dir(self.att_dir()).into_iter().flatten().flatten() {
+            if !keep.contains(&e.file_name().to_string_lossy().into_owned()) { let _ = fs::remove_file(e.path()); }
+        }
+    }
+
+    // ---- bulk actions and duplicate
+    pub fn bulk(&mut self, ids: &[String], op: &str, value: &str) -> Result<usize, String> {
+        if !["folder", "favorite", "unfavorite", "trash", "restore", "tag", "untag"].contains(&op) { return Err("unknown action".into()); }
+        let t = now();
+        let mut n = 0;
+        for it in self.data.items.iter_mut().filter(|i| ids.contains(&i.id)) {
+            match op {
+                "folder" => it.folder = value.trim().to_string(),
+                "favorite" => it.favorite = true,
+                "unfavorite" => it.favorite = false,
+                "trash" => if it.deleted == 0 { it.deleted = t },
+                "restore" => it.deleted = 0,
+                "tag" => { let v = value.trim(); if !v.is_empty() && !it.tags.iter().any(|x| x == v) { it.tags.push(v.to_string()); } }
+                _ => it.tags.retain(|x| x != value.trim()),
+            }
+            it.updated = t;
+            n += 1;
+        }
+        if n > 0 { self.save()?; }
+        Ok(n)
+    }
+
+    /// Puts an earlier version back; the current state becomes a version too, so a restore can be undone.
+    pub fn restore_version(&mut self, id: &str, at: u64) -> Result<(), String> {
+        let it = self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?;
+        let v = it.versions.iter().find(|v| v.at == at).cloned().ok_or("that version no longer exists")?;
+        if !it.same_content(&Item { title: v.title.clone(), folder: v.folder.clone(), tags: v.tags.clone(), notes: v.notes.clone(), expires: v.expires.clone(), category: v.category.clone(), fields: v.fields.clone(), ..Default::default() }) {
+            let cur = it.snapshot();
+            it.versions.push(cur);
+            it.versions.drain(..it.versions.len().saturating_sub(KEEP_VERSIONS));
+        }
+        (it.title, it.folder, it.tags, it.notes, it.expires, it.category, it.fields) = (v.title, v.folder, v.tags, v.notes, v.expires, v.category, v.fields);
+        it.updated = now().max(it.updated + 1); // a distinct timestamp so the restored state is its own point in time
+        self.save()
+    }
+
+    pub fn duplicate(&mut self, id: &str) -> Result<String, String> {
+        let mut c = self.data.items.iter().find(|i| i.id == id).ok_or("item not found")?.clone();
+        c.id = new_id();
+        c.title = format!("{} (copy)", c.title);
+        c.history.clear();
+        c.attachments.clear();
+        c.versions.clear();
+        c.deleted = 0;
+        c.updated = now();
+        self.data.items.push(c.clone());
+        self.save()?;
+        Ok(c.id)
     }
 }
 
@@ -345,6 +604,130 @@ mod tests {
         let a = s.data.items[0].id.clone();
         s.remove(&a).unwrap();
         assert_eq!(s.empty_trash().unwrap(), 1);
+    }
+
+    #[test]
+    fn recovery_key_survives_a_password_change_and_opens_the_vault() {
+        let p = tmp();
+        let mut s = Session::create(&p, "first password", FAST).unwrap();
+        s.upsert(item("Bank")).unwrap();
+        let phrase = s.enable_recovery().unwrap();
+        assert_eq!(phrase.len(), 39); // 8 groups of 4 + 7 dashes
+        s.change_password("first password", "second password", FAST).unwrap(); // re-wraps recovery.bin
+        assert!(Session::recover(&p, "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH", "x", FAST).is_err(), "wrong key");
+        let r = Session::recover(&p, &phrase.to_lowercase().replace('-', " "), "third password", FAST).unwrap(); // case and separators do not matter
+        assert_eq!(r.data.items.len(), 1);
+        assert!(Session::open(&p, "second password").is_err());
+        assert_eq!(Session::open(&p, "third password").unwrap().data.items[0].title, "Bank");
+        let again = Session::open(&p, "third password").unwrap();
+        assert!(Session::recover(&p, &phrase, "fourth password", FAST).is_ok() && again.data.settings.recovery_phrase == phrase, "still works after recovering");
+    }
+
+    #[test]
+    fn attachments_are_encrypted_listed_and_cleaned_up() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let id = s.upsert(item("Passport")).unwrap();
+        let att = s.att_add(&id, "C:\\scans\\passport.pdf", b"TOP-SECRET-SCAN").unwrap();
+        assert_eq!(att.name, "passport.pdf");
+        let s2 = Session::open(&p, "pw").unwrap();
+        assert_eq!(s2.att_get(&att.id).unwrap(), b"TOP-SECRET-SCAN");
+        let file = p.with_file_name("attachments").join(format!("{}.bin", att.id));
+        assert!(!fs::read(&file).unwrap().windows(10).any(|w| w == b"TOP-SECRET"));
+        assert!(s2.att_get("../vault").is_err(), "unknown ids are refused");
+        let mut edit = s.data.items[0].clone();
+        edit.attachments.clear(); // the page cannot drop or forge attachments through save
+        s.upsert(edit).unwrap();
+        assert_eq!(s.data.items[0].attachments.len(), 1);
+        s.att_remove(&id, &att.id).unwrap();
+        assert!(!file.exists(), "removed attachment file is deleted");
+        let a2 = s.att_add(&id, "x.txt", b"x").unwrap();
+        s.remove(&id).unwrap();
+        s.remove(&id).unwrap(); // permanent delete
+        assert!(!p.with_file_name("attachments").join(format!("{}.bin", a2.id)).exists());
+        assert!(s.att_add("nope", "x", b"x").is_err());
+    }
+
+    #[test]
+    fn bulk_actions_duplicate_and_restore_file() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let a = s.upsert(item("A")).unwrap();
+        let b = s.upsert(item("B")).unwrap();
+        let ids = vec![a.clone(), b.clone()];
+        assert_eq!(s.bulk(&ids, "folder", " Work ").unwrap(), 2);
+        s.bulk(&ids, "tag", "urgent").unwrap();
+        s.bulk(&ids, "tag", "urgent").unwrap();
+        s.bulk(&[a.clone()], "favorite", "").unwrap();
+        assert!(s.data.items.iter().all(|i| i.folder == "Work" && i.tags == ["urgent"]));
+        assert!(s.data.items[0].favorite && !s.data.items[1].favorite);
+        s.bulk(&ids, "untag", "urgent").unwrap();
+        assert!(s.data.items.iter().all(|i| i.tags.is_empty()));
+        s.bulk(&[b.clone()], "trash", "").unwrap();
+        assert!(s.data.items[1].deleted > 0);
+        assert!(s.bulk(&ids, "explode", "").is_err());
+        let d = s.duplicate(&a).unwrap();
+        assert_eq!(s.data.items.iter().find(|i| i.id == d).unwrap().title, "A (copy)");
+        // restore from a backup file keeps a safety copy
+        let good = fs::read(&p).unwrap();
+        let other = p.with_file_name("other.bin");
+        let mut o = Session::create(&other, "otherpw", FAST).unwrap();
+        o.upsert(item("Only in other")).unwrap();
+        restore_file(&p, &other).unwrap();
+        assert_eq!(Session::open(&p, "otherpw").unwrap().data.items[0].title, "Only in other");
+        let safety = fs::read_dir(p.with_file_name("backups")).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("pre-restore")).unwrap();
+        assert!(fs::read(safety.path()).unwrap().len() > 100 && good.len() > 100);
+        fs::write(&other, b"not a vault").unwrap();
+        assert!(restore_file(&p, &other).is_err(), "garbage is refused");
+    }
+
+    #[test]
+    fn versions_record_edits_cap_and_restore() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let mut it = item("Bank");
+        it.fields = vec![Field { label: "Username".into(), value: "me".into(), kind: "text".into() }];
+        let id = s.upsert(it).unwrap();
+        assert!(s.data.items[0].versions.is_empty());
+        let same = s.data.items[0].clone();
+        s.upsert(same).unwrap(); // a save without changes adds nothing
+        assert!(s.data.items[0].versions.is_empty());
+        let mut e = s.data.items[0].clone();
+        e.title = "Bank 2".into();
+        e.versions = vec![ItemVersion::default(); 3]; // the page cannot forge versions
+        s.upsert(e).unwrap();
+        assert_eq!(s.data.items[0].versions.len(), 1);
+        assert_eq!(s.data.items[0].versions[0].title, "Bank");
+        let at = s.data.items[0].versions[0].at;
+        s.data.items[0].versions[0].at = 1; // make timestamps distinct for the lookup
+        s.restore_version(&id, 1).unwrap();
+        assert_eq!(s.data.items[0].title, "Bank");
+        assert_eq!(s.data.items[0].versions.last().unwrap().title, "Bank 2", "restore can be undone");
+        assert!(s.restore_version(&id, 999).is_err() && at > 0);
+        for n in 0..40 { let mut e = s.data.items[0].clone(); e.notes = format!("n{n}"); s.upsert(e).unwrap(); }
+        assert_eq!(s.data.items[0].versions.len(), 25, "oldest versions are dropped");
+    }
+
+    #[test]
+    fn merging_two_pcs_keeps_everything_and_the_newer_edit() {
+        let mut a = Data::default();
+        let mut b = Data::default();
+        let it = |id: &str, t: &str, u: u64| Item { id: id.into(), kind: "login".into(), title: t.into(), updated: u, ..Default::default() };
+        a.items = vec![it("1", "old title", 10), it("2", "only here", 5), it("4", "tie local", 7)];
+        b.items = vec![it("1", "new title", 20), it("3", "only there", 6), it("4", "tie remote", 7)];
+        a.settings.accent = "rose".into();
+        let m = merge_data(a, b);
+        let t: Vec<(&str, &str)> = m.items.iter().map(|i| (i.id.as_str(), i.title.as_str())).collect();
+        assert_eq!(t, [("1", "new title"), ("2", "only here"), ("3", "only there"), ("4", "tie local")]);
+        assert_eq!(m.settings.accent, "rose");
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(parse_date("2026-11-22"), Some(20_779));
+        assert_eq!(parse_date(" 2000-02-29 "), Some(11_016));
+        for d in [0i64, 11_016, 19_783, 20_779, 30_000] { let (y, m, dd) = ymd(d); assert_eq!(parse_date(&format!("{y}-{m}-{dd}")), Some(d)); }
+        for bad in ["", "2026-13-01", "2026-11", "x-y-z", "2026-11-22-1"] { assert_eq!(parse_date(bad), None, "{bad}"); }
     }
 
     #[test]

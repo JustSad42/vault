@@ -1,6 +1,6 @@
 //! Security center: weak, reused, old and insecure-site logins, plus an opt-in Have I Been Pwned check
 //! (k-anonymity: only the first 5 characters of each password's SHA-1 leave this PC).
-use crate::{gen, vault::Item};
+use crate::{domain, gen, vault::Item};
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 pub struct Ref { pub id: String, pub title: String, pub note: String }
 
 #[derive(Serialize, Default)]
-pub struct Audit { pub total: usize, pub score: u32, pub weak: Vec<Ref>, pub reused: Vec<Ref>, pub old: Vec<Ref>, pub insecure: Vec<Ref> }
+pub struct Audit { pub total: usize, pub score: u32, pub weak: Vec<Ref>, pub reused: Vec<Ref>, pub old: Vec<Ref>, pub insecure: Vec<Ref>, pub expiring: Vec<Ref> }
 
 fn field<'a>(i: &'a Item, label: &str) -> Option<&'a str> {
     i.fields.iter().find(|f| f.label == label && !f.value.is_empty()).map(|f| f.value.as_str())
@@ -33,6 +33,14 @@ pub fn run(items: &[Item], now: u64) -> Audit {
         }
         if field(i, "Website").is_some_and(|w| w.trim().to_lowercase().starts_with("http://")) {
             a.insecure.push(r(i, "site does not use HTTPS".into())); bad.insert(i.id.clone());
+        }
+    }
+    for i in items.iter().filter(|i| i.deleted == 0 && !i.expires.is_empty()) {
+        let Some(day) = crate::vault::parse_date(&i.expires) else { continue };
+        let left = day - (now / 86400) as i64;
+        if left <= 14 {
+            a.expiring.push(r(i, if left < 0 { format!("expired {} day{} ago", -left, if left == -1 { "" } else { "s" }) } else if left == 0 { "expires today".into() } else { format!("expires in {left} day{}", if left == 1 { "" } else { "s" }) }));
+            bad.insert(i.id.clone());
         }
     }
     a.score = if logins.is_empty() { 100 } else { (100 - 100 * bad.len() / logins.len()) as u32 };
@@ -92,6 +100,35 @@ mod tests {
     }
 
     #[test]
+    fn expiring_items_are_flagged() {
+        let now = 20_779 * 86400; // 2026-11-22
+        let mut a = login("a", "Zt5@nW8*yB3%kD6^", "https://a.x", now);
+        a.expires = "2026-11-30".into();
+        let mut b = login("b", "Xk9#mQ2$vL7&pR4!", "https://b.x", now);
+        b.expires = "2026-11-20".into();
+        let mut c = login("c", "Qw3!rT6&yU9#iO2$", "https://c.x", now);
+        c.expires = "2027-06-01".into();
+        let r = run(&[a, b, c], now);
+        assert_eq!(r.expiring.iter().map(|x| (x.id.as_str(), x.note.as_str())).collect::<Vec<_>>(), [("a", "expires in 8 days"), ("b", "expired 2 days ago")]);
+    }
+
+    #[test]
+    fn flags_for_smart_filters() {
+        let now = 20_779 * 86400;
+        let mut a = login("a", "hunter2", "https://www.site.com", now);
+        a.fields.push(crate::vault::Field { label: "Username".into(), value: "Me".into(), kind: "text".into() });
+        let mut b = login("b", "Xk9#mQ2$vL7&pR4!", "https://site.com/login", now);
+        b.fields.push(crate::vault::Field { label: "Username".into(), value: "me".into(), kind: "text".into() });
+        b.fields.push(crate::vault::Field { label: "One-time code".into(), value: "GEZDGNBV".into(), kind: "totp".into() });
+        let mut c = login("c", "", "", now);
+        c.fields.retain(|f| f.label != "Password" || !f.value.is_empty());
+        let f = flags(&[a, b, c], now);
+        assert!(f["a"].contains(&"weak") && f["a"].contains(&"notp") && f["a"].contains(&"dup"));
+        assert!(f["b"].contains(&"totp") && f["b"].contains(&"dup") && !f["b"].contains(&"weak"));
+        assert!(f["c"].contains(&"nopass"));
+    }
+
+    #[test]
     fn trashed_items_are_ignored() {
         let mut i = login("a", "x", "http://a", 0);
         i.deleted = 5;
@@ -106,4 +143,26 @@ mod tests {
         assert_eq!(count_in(body, "FFFF0000000000000000000000000000000"), 0);
         assert_eq!(count_in(body, "NOTTHERE"), 0);
     }
+}
+
+/// Per-item markers used by smart filters and search: weak reused old http expiring nopass notp totp files dup.
+pub fn flags(items: &[Item], now: u64) -> HashMap<String, Vec<&'static str>> {
+    let a = run(items, now);
+    let mut m: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for (name, list) in [("weak", &a.weak), ("reused", &a.reused), ("old", &a.old), ("http", &a.insecure), ("expiring", &a.expiring)] {
+        for r in list { m.entry(r.id.clone()).or_default().push(name); }
+    }
+    let mut by_user: HashMap<(String, String), Vec<&Item>> = HashMap::new();
+    for i in items.iter().filter(|i| i.deleted == 0) {
+        let f = m.entry(i.id.clone()).or_default();
+        if i.kind == "login" {
+            if field(i, "Password").is_none() { f.push("nopass"); }
+            else if !i.fields.iter().any(|x| x.kind == "totp" && !x.value.is_empty()) { f.push("notp"); }
+            if let (Some(h), Some(u)) = (field(i, "Website").and_then(domain::host_of), field(i, "Username")) { by_user.entry((domain::etld1(&h), u.to_lowercase())).or_default().push(i); }
+        }
+        if i.fields.iter().any(|x| x.kind == "totp" && !x.value.is_empty()) { f.push("totp"); }
+        if !i.attachments.is_empty() { f.push("files"); }
+    }
+    for group in by_user.values().filter(|g| g.len() > 1) { for i in group { m.entry(i.id.clone()).or_default().push("dup"); } }
+    m
 }

@@ -6,8 +6,12 @@ use serde::Serialize;
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Account { pub title: String, pub account: String, pub uri: String }
 
+/// Google Authenticator splits big exports into several QR codes; each carries its place in the set.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Batch { pub id: i64, pub index: u64, pub size: u64 }
+
 #[derive(Serialize, Default, Debug)]
-pub struct Parsed { pub accounts: Vec<Account>, pub skipped: usize }
+pub struct Parsed { pub accounts: Vec<Account>, pub skipped: usize, pub batches: Vec<Batch>, pub foreign: bool }
 
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -63,12 +67,13 @@ fn make(issuer: &str, name: &str, secret: &str, alg: &str, digits: u32, period: 
     Account { title: if issuer.is_empty() { name.clone() } else { issuer.to_string() }, account: name, uri }
 }
 
-fn from_migration(data: &str) -> Option<(Vec<Account>, usize)> {
+fn from_migration(data: &str) -> Option<(Vec<Account>, usize, Option<Batch>)> {
     let raw = pct_decode(data).replace(' ', "+"); // a '+' in a URL turns into a space
     let clean: String = raw.chars().filter(|c| *c != '=' && !c.is_whitespace()).collect();
     let bytes = if clean.contains('-') || clean.contains('_') { BASE64URL_NOPAD.decode(clean.as_bytes()) } else { BASE64_NOPAD.decode(clean.as_bytes()) }.ok()?;
-    let (mut out, mut skipped) = (vec![], 0);
+    let (mut out, mut skipped, mut size, mut index, mut id) = (vec![], 0, 0u64, 0u64, 0i64);
     for (f, v) in fields(&bytes)? {
+        if let V::Num(n) = v { match f { 3 => size = n, 4 => index = n, 5 => id = n as i32 as i64, _ => {} } continue; }
         let (1, V::Bytes(m)) = (f, v) else { continue };
         let (mut secret, mut name, mut issuer, mut alg, mut digits, mut kind) = (&[][..], String::new(), String::new(), 1u64, 1u64, 2u64);
         for (f, v) in fields(m)? {
@@ -86,7 +91,7 @@ fn from_migration(data: &str) -> Option<(Vec<Account>, usize)> {
         if kind == 1 || secret.is_empty() || alg.is_empty() { skipped += 1; continue; } // HOTP or MD5
         out.push(make(&issuer, &name, &BASE32_NOPAD.encode(secret), alg, if digits == 2 { 8 } else { 6 }, 30));
     }
-    Some((out, skipped))
+    Some((out, skipped, if size > 0 { Some(Batch { id, index, size }) } else { None }))
 }
 
 fn from_otpauth(uri: &str) -> Result<Account, bool> { // Err(true) = valid but unsupported (HOTP)
@@ -108,7 +113,7 @@ pub fn parse_text(text: &str) -> Parsed {
         let low = tok.to_lowercase();
         if low.starts_with("otpauth-migration://") {
             let data = tok.split_once("data=").map(|x| x.1.split('&').next().unwrap_or("")).unwrap_or("");
-            match from_migration(data) { Some((a, s)) => { p.accounts.extend(a); p.skipped += s; } None => p.skipped += 1 }
+            match from_migration(data) { Some((a, s, b)) => { p.accounts.extend(a); p.skipped += s; p.batches.extend(b); } None => p.skipped += 1 }
         } else if low.starts_with("otpauth://") {
             match from_otpauth(tok) { Ok(a) => p.accounts.push(a), Err(_) => p.skipped += 1 }
         }
@@ -141,6 +146,7 @@ mod tests {
         payload.extend_from_slice(&[2 << 3, 1, 3 << 3, 1, 4 << 3, 0]); // version, batch fields are ignored
         let p = parse_text(&link(&payload));
         assert_eq!(p.skipped, 1);
+        assert_eq!(p.batches, vec![Batch { id: 0, index: 0, size: 1 }]);
         assert_eq!(p.accounts.len(), 2);
         assert_eq!((p.accounts[0].title.as_str(), p.accounts[0].account.as_str()), ("Example", "alice@x.com"));
         assert!(p.accounts[0].uri.contains("secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"));
