@@ -28,7 +28,7 @@ Windows with Rust, Node and the MSVC Build Tools:
 npm install
 npx tauri icon app-icon.png          # once, makes the icons
 npm test                             # front-end unit tests
-cd src-tauri && cargo test --lib     # 48 Rust tests
+cd src-tauri && cargo test --lib     # 48 Rust tests, plus the end-to-end scripts in pc-tools
 npx tauri build                      # installer in src-tauri\target\release\bundle\nsis
 ```
 To publish a release (maintainer): set `TAURI_SIGNING_PRIVATE_KEY_PATH` to the update-signing key, bump the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json`, run `npx tauri build`, then `node scripts/release.mjs "notes"` (needs the GitHub CLI). `pc-tools/drive.mjs` and `pc-tools/drive-ext.mjs` are end-to-end tests that run the real app and a real browser (fake data only).
