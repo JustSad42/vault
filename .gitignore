@@ -1,0 +1,17 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+src-tauri/icons
+*.key
+*.pem
+.env
+vault.bin
+quick.bin
+# author's dev tooling (drives builds on a Windows PC from a Linux server) and local notes
+pc.sh
+CLAUDE.md
+pc-tools/*.cmd
+*.log
+src-tauri/icons/android
+src-tauri/icons/ios
