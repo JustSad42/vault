@@ -197,6 +197,16 @@ pub fn new_phrase() -> String {
     data_encoding::BASE32_NOPAD.encode(&b).as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
 }
 
+/// Writes through a temporary file, flushed to disk, then renames it over `path`: a crash leaves the old file or the new one, never half of one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() { fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    let tmp = path.with_extension("tmp");
+    let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    f.write_all(bytes).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
+    drop(f);
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 /// Puts a chosen backup file in place of the vault (keeping a safety copy of the current one).
 pub fn restore_file(vault: &Path, from: &Path) -> Result<(), String> {
     let b = fs::read(from).map_err(|e| e.to_string())?;
@@ -207,8 +217,7 @@ pub fn restore_file(vault: &Path, from: &Path) -> Result<(), String> {
         let (y, m, d) = ymd((now() / 86400) as i64);
         fs::copy(vault, dir.join(format!("pre-restore-{y:04}-{m:02}-{d:02}-{}.bin", now() % 86400))).map_err(|e| e.to_string())?;
     }
-    let tmp = vault.with_extension("tmp");
-    fs::write(&tmp, &b).and_then(|_| fs::rename(&tmp, vault)).map_err(|e| e.to_string())
+    write_atomic(vault, &b)
 }
 
 /// Decrypts vault-file bytes with a key (used by sync to look inside the server's copy).
@@ -276,12 +285,8 @@ impl Session {
 
     pub fn save(&self) -> Result<(), String> {
         let bytes = seal(&self.key, &self.salt, self.kdf, &self.data)?;
-        if let Some(dir) = self.path.parent() { fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
         if self.path.exists() { self.backup(); }
-        let tmp = self.path.with_extension("tmp");
-        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(&bytes).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        write_atomic(&self.path, &bytes)?;
         self.gc_attachments();
         Ok(())
     }
@@ -322,12 +327,15 @@ impl Session {
     /// First call moves the item to the trash, a second call (from the trash) deletes it for good.
     pub fn remove(&mut self, id: &str) -> Result<(), String> {
         let it = self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?;
-        if it.deleted == 0 { it.deleted = now(); } else { self.data.items.retain(|i| i.id != id); }
+        // bumping `updated` lets a sync merge carry the trashing over to other PCs
+        if it.deleted == 0 { it.deleted = now(); it.updated = it.deleted; } else { self.data.items.retain(|i| i.id != id); }
         self.save()
     }
 
     pub fn restore(&mut self, id: &str) -> Result<(), String> {
-        self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?.deleted = 0;
+        let it = self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?;
+        it.deleted = 0;
+        it.updated = now();
         self.save()
     }
 
@@ -380,9 +388,7 @@ impl Session {
         let mut out = RMAGIC.to_vec();
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-        let to = self.path.with_file_name("recovery.bin");
-        let tmp = to.with_extension("tmp");
-        fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &to)).map_err(|e| e.to_string())
+        write_atomic(&self.path.with_file_name("recovery.bin"), &out)
     }
 
     /// Creates (or replaces) the recovery key and returns it to show once.
@@ -418,10 +424,9 @@ impl Session {
         OsRng.fill_bytes(&mut nonce);
         let ct = XChaCha20Poly1305::new(Key::from_slice(&*self.key)).encrypt(XNonce::from_slice(&nonce), Payload { msg: bytes, aad: id.as_bytes() })
             .map_err(|_| "encryption failed".to_string())?;
-        fs::create_dir_all(self.att_dir()).map_err(|e| e.to_string())?;
         let mut out = nonce.to_vec();
         out.extend_from_slice(&ct);
-        fs::write(self.att_dir().join(format!("{id}.bin")), out).map_err(|e| e.to_string())?;
+        write_atomic(&self.att_dir().join(format!("{id}.bin")), &out)?;
         let att = Att { id, name: name.rsplit(['\\', '/']).next().unwrap_or(name).to_string(), size: bytes.len() as u64 };
         let it = self.data.items.iter_mut().find(|i| i.id == item_id).unwrap();
         it.attachments.push(att.clone());
@@ -446,11 +451,13 @@ impl Session {
         self.save()
     }
 
-    /// Deletes attachment files no item refers to any more (permanent delete, emptied trash).
+    /// Deletes attachment files no item refers to any more (permanent delete, emptied trash). Only `.bin` files: a `.tmp`
+    /// may be a download that sync is writing right now.
     fn gc_attachments(&self) {
         let keep: std::collections::HashSet<String> = self.data.items.iter().flat_map(|i| i.attachments.iter().map(|a| format!("{}.bin", a.id))).collect();
         for e in fs::read_dir(self.att_dir()).into_iter().flatten().flatten() {
-            if !keep.contains(&e.file_name().to_string_lossy().into_owned()) { let _ = fs::remove_file(e.path()); }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".bin") && !keep.contains(&name) { let _ = fs::remove_file(e.path()); }
         }
     }
 
@@ -604,6 +611,23 @@ mod tests {
         let a = s.data.items[0].id.clone();
         s.remove(&a).unwrap();
         assert_eq!(s.empty_trash().unwrap(), 1);
+    }
+
+    #[test]
+    fn trash_and_restore_count_as_changes_for_sync() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let id = s.upsert(item("A")).unwrap();
+        s.data.items[0].updated = 1;
+        s.remove(&id).unwrap();
+        assert!(s.data.items[0].updated > 1, "trashing bumps updated");
+        s.data.items[0].updated = 1;
+        s.restore(&id).unwrap();
+        assert!(s.data.items[0].updated > 1, "restoring bumps updated");
+        // the trashed copy wins a merge against an older live copy
+        let live = Data { items: vec![Item { updated: 5, ..s.data.items[0].clone() }], ..Default::default() };
+        s.remove(&id).unwrap();
+        assert!(merge_data(s.data.clone(), live).items[0].deleted > 0);
     }
 
     #[test]

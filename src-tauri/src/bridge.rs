@@ -5,8 +5,11 @@ use crate::{domain, gen, passkey, totp, vault::{self, Field, Item, Paired}, App}
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::{BufRead, BufReader, Write}, net::{TcpListener, TcpStream}, sync::Mutex, time::{Duration, Instant}};
+use std::{io::{BufRead, BufReader, Read, Write}, net::{TcpListener, TcpStream}, sync::Mutex, time::{Duration, Instant}};
 use tauri::{AppHandle, Manager};
+
+/// The native host relays messages of at most 4 MiB; a longer line drops the connection instead of growing without bound.
+const MAX_LINE: usize = 4 * 1024 * 1024 + 1024;
 
 static PAIRING: Mutex<Option<(String, Instant, u8)>> = Mutex::new(None);
 
@@ -42,8 +45,12 @@ pub fn serve(app: AppHandle) {
 fn handle(app: AppHandle, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
     let Ok(mut w) = stream.try_clone() else { return };
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+    let mut r = BufReader::new(stream);
+    loop {
+        let mut line = Vec::new();
+        match (&mut r).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut line) { Ok(0) | Err(_) => break, Ok(_) => {} }
+        if line.len() > MAX_LINE { break; }
+        let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
         let mut resp = dispatch(&app, &req).unwrap_or_else(|e| json!({ "error": e }));
         resp["rid"] = req["rid"].clone(); // `id` is the item id in many requests, so the message id has its own name
         if writeln!(w, "{resp}").is_err() { break; }

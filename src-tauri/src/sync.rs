@@ -6,7 +6,7 @@
 use crate::vault;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Read, path::Path, time::Duration};
+use std::{fs, io::Read, path::{Path, PathBuf}, time::{Duration, UNIX_EPOCH}};
 
 pub enum Put { Ok(u64), Conflict(u64) }
 
@@ -21,14 +21,46 @@ pub trait Remote {
     fn put_att(&self, id: &str, data: &[u8]) -> Result<(), String>;
 }
 
+/// `size` and `mtime` (ns) describe vault.bin when its hash was last confirmed equal to `hash`; 0 = unknown.
 #[derive(Serialize, Deserialize, Default, Clone)]
-pub struct State { pub rev: u64, pub hash: String, pub at: u64 }
+pub struct State { pub rev: u64, pub hash: String, pub at: u64, #[serde(default)] pub size: u64, #[serde(default)] pub mtime: u64 }
+
+/// How many pre-sync safety copies of the vault file to keep in backups/.
+const KEEP_PRE_SYNC: usize = 10;
 
 fn hash(b: &[u8]) -> String { data_encoding::HEXLOWER.encode(&Sha256::digest(b)) }
+fn stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64))
+}
 pub fn load_state(dir: &Path) -> State { fs::read(dir.join("sync.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default() }
-fn save_state(dir: &Path, rev: u64, h: String) { let _ = fs::write(dir.join("sync.json"), serde_json::to_vec(&State { rev, hash: h, at: vault::now() }).unwrap_or_default()); }
-/// True when the vault file differs from what was last synced.
-pub fn pending(dir: &Path) -> bool { fs::read(dir.join("vault.bin")).map(|b| hash(&b) != load_state(dir).hash).unwrap_or(false) }
+fn save_state(dir: &Path, rev: u64, h: String) {
+    // remember the file's size and time only if the file on disk really is the synced one (a save may have slipped in)
+    let p = dir.join("vault.bin");
+    let before = stamp(&p);
+    let (size, mtime) = match (before, fs::read(&p)) { (Some(st), Ok(b)) if hash(&b) == h => st, _ => (0, 0) };
+    let state = State { rev, hash: h, at: vault::now(), size, mtime };
+    let _ = vault::write_atomic(&dir.join("sync.json"), &serde_json::to_vec(&state).unwrap_or_default());
+}
+/// True when the vault file differs from what was last synced. Checked every few seconds, so an unchanged size and
+/// modification time answer without reading and hashing the whole file.
+pub fn pending(dir: &Path) -> bool {
+    let (p, st) = (dir.join("vault.bin"), load_state(dir));
+    if st.size > 0 && stamp(&p) == Some((st.size, st.mtime)) { return false; }
+    fs::read(&p).map(|b| hash(&b) != st.hash).unwrap_or(false)
+}
+
+/// A copy of the vault file as it was before sync replaced it, newest few kept.
+fn keep_pre_sync(dir: &Path) -> Result<(), String> {
+    let b = dir.join("backups");
+    fs::create_dir_all(&b).map_err(|e| e.to_string())?;
+    fs::copy(dir.join("vault.bin"), b.join(format!("pre-sync-{:012}.bin", vault::now()))).map_err(|e| e.to_string())?;
+    let mut all: Vec<PathBuf> = fs::read_dir(&b).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("pre-sync-"))).collect();
+    all.sort();
+    while all.len() > KEEP_PRE_SYNC { let _ = fs::remove_file(all.remove(0)); }
+    Ok(())
+}
 
 pub enum Plan { Idle, Push { local: Vec<u8>, if_match: u64 }, Adopt { bytes: Vec<u8>, rev: u64, base: String }, Merge { bytes: Vec<u8>, rev: u64, base: String } }
 #[derive(Debug, PartialEq)]
@@ -52,8 +84,8 @@ pub fn apply(dir: &Path, plan: &Plan) -> Result<(), String> {
     let (bytes, base) = match plan { Plan::Adopt { bytes, base, .. } | Plan::Merge { bytes, base, .. } => (bytes, base), _ => return Ok(()) };
     let path = dir.join("vault.bin");
     if hash(&fs::read(&path).map_err(|e| e.to_string())?) != *base { return Err("the vault changed while syncing; it will be tried again".into()); }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, &path)).map_err(|e| e.to_string())
+    keep_pre_sync(dir)?;
+    vault::write_atomic(&path, bytes)
 }
 
 pub fn finish(dir: &Path, remote: &dyn Remote, plan: &Plan, key: &[u8; 32]) -> Result<Outcome, String> {
@@ -65,7 +97,7 @@ pub fn finish(dir: &Path, remote: &dyn Remote, plan: &Plan, key: &[u8; 32]) -> R
         },
         Plan::Adopt { bytes, rev, .. } => {
             save_state(dir, *rev, hash(bytes));
-            if let Some(r) = remote.get_recovery()? { let _ = fs::write(dir.join("recovery.bin"), r); }
+            if let Some(r) = remote.get_recovery()? { let _ = vault::write_atomic(&dir.join("recovery.bin"), &r); }
             Outcome::Pulled
         }
         Plan::Merge { bytes, rev, .. } => match remote.put_vault(bytes, *rev)? {
@@ -92,7 +124,7 @@ fn attachments(dir: &Path, remote: &dyn Remote, key: &[u8; 32]) -> Result<(), St
         let f = adir.join(format!("{id}.bin"));
         if f.exists() { if !have.iter().any(|h| h == id) { remote.put_att(id, &fs::read(&f).map_err(|e| e.to_string())?)?; } }
         else if have.iter().any(|h| h == id) {
-            if let Some(b) = remote.get_att(id)? { fs::create_dir_all(&adir).map_err(|e| e.to_string())?; fs::write(&f, b).map_err(|e| e.to_string())?; }
+            if let Some(b) = remote.get_att(id)? { vault::write_atomic(&f, &b)?; }
         }
     }
     Ok(())
@@ -102,11 +134,10 @@ fn attachments(dir: &Path, remote: &dyn Remote, key: &[u8; 32]) -> Result<(), St
 pub fn restore(dir: &Path, remote: &dyn Remote) -> Result<(), String> {
     if dir.join("vault.bin").exists() { return Err("this PC already has a vault".into()); }
     let (blob, rev) = remote.get_vault()?.ok_or("nothing is stored on the server for that sync key")?;
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    fs::write(dir.join("vault.bin"), &blob).map_err(|e| e.to_string())?;
-    if let Some(r) = remote.get_recovery()? { fs::write(dir.join("recovery.bin"), r).map_err(|e| e.to_string())?; }
+    if let Some(r) = remote.get_recovery()? { vault::write_atomic(&dir.join("recovery.bin"), &r)?; }
     let adir = dir.join("attachments");
-    for id in remote.list_att()? { if let Some(b) = remote.get_att(&id)? { fs::create_dir_all(&adir).map_err(|e| e.to_string())?; fs::write(adir.join(format!("{id}.bin")), b).map_err(|e| e.to_string())?; } }
+    for id in remote.list_att()? { if let Some(b) = remote.get_att(&id)? { vault::write_atomic(&adir.join(format!("{id}.bin")), &b)?; } }
+    vault::write_atomic(&dir.join("vault.bin"), &blob)?; // last: a restore cut short leaves no vault, so it can simply be run again
     save_state(dir, rev, hash(&blob));
     Ok(())
 }
@@ -279,5 +310,32 @@ mod tests {
         assert!(!pending(&d));
         a.upsert(item("z")).unwrap();
         assert!(pending(&d));
+        round(&d, &srv, &mut a, "pw-pending-1");
+        let st = load_state(&d);
+        assert!(st.size > 0 && st.mtime > 0, "a confirmed sync remembers size and time");
+        // same size, new time: falls back to the hash, which still matches
+        let b = fs::read(d.join("vault.bin")).unwrap();
+        fs::write(d.join("vault.bin"), &b).unwrap();
+        assert!(!pending(&d));
+        let mut changed = b.clone();
+        let n = changed.len() - 1;
+        changed[n] ^= 1;
+        fs::write(d.join("vault.bin"), &changed).unwrap();
+        assert!(pending(&d), "same size, different bytes");
+    }
+
+    #[test]
+    fn adopting_the_server_copy_keeps_a_safety_copy() {
+        let (da, db, srv) = (dir(), dir(), Fake::default());
+        let mut a = Session::create(&da.join("vault.bin"), "pw-copy-123", FAST).unwrap();
+        a.upsert(item("one")).unwrap();
+        round(&da, &srv, &mut a, "pw-copy-123");
+        restore(&db, &srv).unwrap();
+        let mut b = Session::open(&db.join("vault.bin"), "pw-copy-123").unwrap();
+        b.upsert(item("two")).unwrap();
+        round(&db, &srv, &mut b, "pw-copy-123");
+        assert_eq!(round(&da, &srv, &mut a, "pw-copy-123"), Outcome::Pulled);
+        let copies: Vec<_> = fs::read_dir(da.join("backups")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("pre-sync-")).collect();
+        assert_eq!(copies.len(), 1);
     }
 }

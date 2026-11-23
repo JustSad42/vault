@@ -385,12 +385,19 @@ function viewField(f: Field): HTMLElement {
     val.append(code, ring.el);
     let cur = '';
     get = () => cur;
+    // ask Rust for a code once per period; in between only the countdown moves
+    let left = 0, period = 30, busy = false;
     const tick = async () => {
+      if (left > 1) { left--; ring.set(left, period); row.classList.toggle('low', left <= 5); return; }
+      if (busy) return;
+      busy = true;
       try {
         const o = await call<{ code: string; left: number; period: number }>('totp', { secret: f.value });
         cur = o.code; code.textContent = `${o.code.slice(0, o.code.length / 2)} ${o.code.slice(o.code.length / 2)}`;
+        left = o.left; period = o.period;
         ring.set(o.left, o.period); row.classList.toggle('low', o.left <= 5);
-      } catch (e) { cur = ''; code.textContent = String(e); }
+      } catch (e) { cur = ''; left = 0; code.textContent = String(e); }
+      busy = false;
     };
     tick(); ticks.push(window.setInterval(tick, 1000));
   } else {

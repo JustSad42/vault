@@ -118,9 +118,7 @@ async fn unlock(st: St<'_>, password: String) -> Result<(), String> {
 }
 
 fn quick_write(s: &Session) -> Result<(), String> {
-    let blob = quick::protect(&s.key()[..])?;
-    let tmp = quick_path().with_extension("tmp");
-    std::fs::write(&tmp, blob).and_then(|_| std::fs::rename(&tmp, quick_path())).map_err(|e| e.to_string())
+    vault::write_atomic(&quick_path(), &quick::protect(&s.key()[..])?)
 }
 
 /// Stay signed in on this PC: needs the vault to be unlocked right now.
@@ -547,7 +545,8 @@ fn bridge_paired(st: St) -> Result<Vec<serde_json::Value>, String> {
 }
 
 #[tauri::command]
-fn bridge_revoke(st: St, name: String) -> Result<(), String> { with(&st, |s| { s.data.settings.paired.retain(|p| p.name != name); s.save() }) }
+/// One pairing: several can share a name (the same browser paired again, or two profiles).
+fn bridge_revoke(st: St, name: String, created: u64) -> Result<(), String> { with(&st, |s| { s.data.settings.paired.retain(|p| !(p.name == name && p.created == created)); s.save() }) }
 
 /// Writes the extension to a folder (for "Load unpacked") and opens it.
 #[tauri::command]

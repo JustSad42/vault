@@ -56,8 +56,11 @@ class H(BaseHTTPRequestHandler):
         return t if TOKEN_RE.match(t) else None
 
     def body(self, limit):
-        n = int(self.headers.get('Content-Length') or 0)
-        if n > limit:
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > limit:  # a negative length would make rfile.read() read without limit
             self.reply(413, {'error': 'too large'})
             return None
         return self.rfile.read(n)

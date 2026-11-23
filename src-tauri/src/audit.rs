@@ -15,6 +15,17 @@ fn field<'a>(i: &'a Item, label: &str) -> Option<&'a str> {
     i.fields.iter().find(|f| f.label == label && !f.value.is_empty()).map(|f| f.value.as_str())
 }
 
+/// When the current password was set, as well as the item knows: the latest password change in its history, else the
+/// oldest version that already had this password, else the last edit. Tagging or moving an item does not make it "new".
+fn password_since(i: &Item, pw: &str) -> u64 {
+    if let Some(at) = i.history.iter().filter(|h| h.label == "Password").map(|h| h.at).max() { return at; }
+    let mut since = i.updated;
+    for v in i.versions.iter().rev() {
+        if v.fields.iter().any(|f| f.label == "Password" && f.value == pw) { since = since.min(v.at); } else { break; }
+    }
+    since
+}
+
 pub fn run(items: &[Item], now: u64) -> Audit {
     let logins: Vec<&Item> = items.iter().filter(|i| i.deleted == 0 && i.kind == "login").collect();
     let mut a = Audit { total: logins.len(), ..Default::default() };
@@ -28,7 +39,7 @@ pub fn run(items: &[Item], now: u64) -> Audit {
             if b < 60.0 { a.weak.push(r(i, format!("{} password", gen::level(b)))); bad.insert(i.id.clone()); }
             let n = by_pw[p].len();
             if n > 1 { a.reused.push(r(i, format!("same password on {} other item{}", n - 1, if n == 2 { "" } else { "s" }))); bad.insert(i.id.clone()); }
-            let days = now.saturating_sub(i.updated) / 86400;
+            let days = now.saturating_sub(password_since(i, p)) / 86400;
             if days > 365 { a.old.push(r(i, format!("unchanged for {} months", days / 30))); bad.insert(i.id.clone()); }
         }
         if field(i, "Website").is_some_and(|w| w.trim().to_lowercase().starts_with("http://")) {
@@ -54,6 +65,9 @@ fn count_in(body: &str, suffix: &str) -> u64 {
     body.lines().filter_map(|l| l.trim().split_once(':')).find(|(s, _)| s.eq_ignore_ascii_case(suffix)).and_then(|(_, c)| c.trim().parse().ok()).unwrap_or(0)
 }
 
+/// Parallel requests to the range API: one shared agent keeps its TLS connections open between requests.
+const BREACH_THREADS: usize = 6;
+
 /// `list` = (id, title, password). One request per distinct 5-character prefix.
 pub fn breaches(list: Vec<(String, String, String)>) -> Result<Vec<Ref>, String> {
     let mut by_prefix: HashMap<String, Vec<(usize, String)>> = HashMap::new();
@@ -61,16 +75,25 @@ pub fn breaches(list: Vec<(String, String, String)>) -> Result<Vec<Ref>, String>
         let h = sha1_hex(pw);
         by_prefix.entry(h[..5].to_string()).or_default().push((n, h[5..].to_string()));
     }
+    let work: Vec<(String, Vec<(usize, String)>)> = by_prefix.into_iter().collect();
+    if work.is_empty() { return Ok(vec![]); }
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+    let chunk = work.len().div_ceil(BREACH_THREADS);
+    let found: Vec<Result<Vec<(usize, u64)>, String>> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = work.chunks(chunk).map(|part| { let agent = agent.clone(); sc.spawn(move || {
+            let mut hits = vec![];
+            for (prefix, entries) in part {
+                let body = agent.get(&format!("https://api.pwnedpasswords.com/range/{prefix}")).set("Add-Padding", "true").call()
+                    .map_err(|e| format!("could not reach api.pwnedpasswords.com: {e}"))?.into_string().map_err(|e| e.to_string())?;
+                for (n, suffix) in entries { let c = count_in(&body, suffix); if c > 0 { hits.push((*n, c)); } }
+            }
+            Ok(hits)
+        }) }).collect();
+        jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err("breach check failed".into()))).collect()
+    });
     let mut out = vec![];
-    for (prefix, entries) in by_prefix {
-        let body = ureq::get(&format!("https://api.pwnedpasswords.com/range/{prefix}")).set("Add-Padding", "true")
-            .timeout(std::time::Duration::from_secs(10)).call().map_err(|e| format!("could not reach api.pwnedpasswords.com: {e}"))?
-            .into_string().map_err(|e| e.to_string())?;
-        for (n, suffix) in entries {
-            let c = count_in(&body, &suffix);
-            if c > 0 { out.push(Ref { id: list[n].0.clone(), title: list[n].1.clone(), note: format!("seen {c} times in known breaches") }); }
-        }
-    }
+    for r in found { for (n, c) in r? { out.push(Ref { id: list[n].0.clone(), title: list[n].1.clone(), note: format!("seen {c} times in known breaches") }); } }
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     Ok(out)
 }
 
@@ -97,6 +120,20 @@ mod tests {
         assert_eq!(ids(&a.insecure), ["b"]);
         assert_eq!(a.score, 0); // all four have a problem
         assert_eq!(run(&[], now).score, 100);
+    }
+
+    #[test]
+    fn password_age_ignores_edits_that_keep_the_password() {
+        let now = 1_000_000_000;
+        let year = 400 * 86400;
+        // tagged yesterday, but the password has been the same since a version from 400 days ago
+        let mut a = login("a", "Zt5@nW8*yB3%kD6^", "https://a.x", now - 86400);
+        a.versions = vec![crate::vault::ItemVersion { at: now - year, fields: a.fields.clone(), ..Default::default() }];
+        // changed 10 days ago according to history, though an old version had another password
+        let mut b = login("b", "Xk9#mQ2$vL7&pR4!", "https://b.x", now - 86400);
+        b.history = vec![crate::vault::Hist { label: "Password".into(), value: "older".into(), at: now - 10 * 86400 }];
+        let r = run(&[a, b], now);
+        assert_eq!(r.old.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["a"]);
     }
 
     #[test]
