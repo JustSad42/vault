@@ -2,7 +2,7 @@ import { open as openFile, save } from '@tauri-apps/plugin-dialog';
 import { getVersion } from '@tauri-apps/api/app';
 import {
   ACCENTS, Acct, Att, F, Item, ItemVersion, KINDS, NEW_KINDS, Parsed, Settings, Sum, Template, ago, applyTheme, avatar, b64, bytes, call, copyText, dialog, err, h, hooks, icon, iconBtn, invoke,
-  isImage, meter, mimeOf, prepareFile, put, pwField, S, toast, chip, Kind, TEMPLATES,
+  isImage, meter, mimeOf, prepareFile, put, pwField, S, toast, chip, Kind, TEMPLATES, SecretRef, fieldRef, isHidden, reveal,
 } from './kit';
 
 // ---------- small helpers ----------
@@ -32,18 +32,36 @@ export async function saveSettings() {
 }
 
 // ---------- generator ----------
-let genOpts = { len: 20, lower: true, upper: true, digits: true, symbols: true };
+let genOpts = { mode: 'password' as 'password' | 'words', len: 20, lower: true, upper: true, digits: true, symbols: true, words: 5, sep: '-', capitalize: true, number: true };
 export function genDialog(use?: (pw: string) => void) {
   const m = meter();
   const out = h('input', { readOnly: true, class: 'mono' });
-  const run = async () => { try { out.value = await call<string>('generate', genOpts); m.update(out.value); } catch (e) { out.value = ''; err(e); } };
-  const lab = h('label', {}, `Length ${genOpts.len}`);
-  const len = h('input', { type: 'range', min: 8, max: 64, value: genOpts.len, oninput: () => { genOpts.len = +len.value; lab.textContent = `Length ${genOpts.len}`; run(); } });
-  const box = (k: 'lower' | 'upper' | 'digits' | 'symbols', text: string) => {
-    const c = h('input', { type: 'checkbox', checked: genOpts[k], onchange: () => { genOpts[k] = c.checked; run(); } });
+  const o = genOpts;
+  const run = async () => {
+    try {
+      out.value = o.mode === 'words'
+        ? await call<string>('generate_passphrase', { words: o.words, sep: o.sep, capitalize: o.capitalize, number: o.number })
+        : await call<string>('generate', { len: o.len, lower: o.lower, upper: o.upper, digits: o.digits, symbols: o.symbols });
+      m.update(out.value);
+    } catch (e) { out.value = ''; err(e); }
+  };
+  const lab = h('label', {}, `Length ${o.len}`);
+  const len = h('input', { type: 'range', min: 8, max: 64, value: o.len, oninput: () => { o.len = +len.value; lab.textContent = `Length ${o.len}`; run(); } });
+  const box = (k: 'lower' | 'upper' | 'digits' | 'symbols' | 'capitalize' | 'number', text: string) => {
+    const c = h('input', { type: 'checkbox', checked: o[k], onchange: () => { o[k] = c.checked; run(); } });
     return h('label', { class: 'chk' }, c, ' ' + text);
   };
-  dialog(close => [h('h3', {}, 'Password generator'), out, m.el, lab, len, h('div', { class: 'opts' }, box('lower', 'a-z'), box('upper', 'A-Z'), box('digits', '0-9'), box('symbols', 'Symbols')),
+  const wlab = h('label', {}, `${o.words} words`);
+  const words = h('input', { type: 'range', min: 3, max: 10, value: o.words, oninput: () => { o.words = +words.value; wlab.textContent = `${o.words} words`; run(); } });
+  const sep = h('select', { 'aria-label': 'Separator', onchange: () => { o.sep = sep.value; run(); } },
+    ...([['-', 'Hyphen  -'], [' ', 'Space'], ['.', 'Dot  .'], ['_', 'Underscore  _'], ['', 'None']] as [string, string][]).map(([v, n]) => h('option', { value: v, selected: v === o.sep }, n)));
+  const pwBox = h('div', {}, lab, len, h('div', { class: 'opts' }, box('lower', 'a-z'), box('upper', 'A-Z'), box('digits', '0-9'), box('symbols', 'Symbols')));
+  const wBox = h('div', {}, wlab, words, h('div', { class: 'opts' }, sep, box('capitalize', 'Capitals'), box('number', 'A digit')),
+    h('small', { class: 'hint' }, 'Random words from the EFF list: easy to type and remember, about 13 bits of strength per word.'));
+  const showMode = () => { pwBox.hidden = o.mode !== 'password'; wBox.hidden = o.mode !== 'words'; seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.m === o.mode)); };
+  const seg = h('div', { class: 'seg' }, ...([['password', 'Password'], ['words', 'Passphrase']] as const).map(([k, n]) => h('button', { type: 'button', 'data-m': k, onclick: () => { o.mode = k; showMode(); run(); } }, n)));
+  showMode();
+  dialog(close => [h('h3', {}, 'Password generator'), seg, out, m.el, pwBox, wBox,
     h('div', { class: 'btns' }, h('button', { onclick: run }, icon('restore'), h('span', {}, 'Regenerate')), h('button', { onclick: () => out.value && copyText(out.value) }, icon('copy'), h('span', {}, 'Copy')),
       use ? h('button', { class: 'primary', onclick: () => { if (out.value) { use(out.value); close(); } } }, 'Use') : null, h('button', { onclick: close }, 'Close'))]);
   run();
@@ -147,26 +165,34 @@ export async function importShareDialog() {
 
 // ---------- version history ----------
 export function versionsDialog(it: Item) {
-  type St = Pick<ItemVersion, 'title' | 'folder' | 'tags' | 'notes' | 'expires' | 'category' | 'fields'>;
-  const cur: St = { title: it.title, folder: it.folder, tags: it.tags, notes: it.notes, expires: it.expires, category: it.category, fields: it.fields };
-  const states: { at: number; s: St; current: boolean }[] = [...it.versions.map(v => ({ at: v.at, s: v as St, current: false })), { at: it.updated, s: cur, current: true }];
-  const diff = (a: St, b: St): { what: string; from: string; to: string; secret: boolean }[] => {
-    const out: { what: string; from: string; to: string; secret: boolean }[] = [];
+  type St = Pick<ItemVersion, 'title' | 'folder' | 'tags' | 'notes' | 'expires' | 'category' | 'fields'> & { ref: (idx: number) => SecretRef };
+  const cur: St = { title: it.title, folder: it.folder, tags: it.tags, notes: it.notes, expires: it.expires, category: it.category, fields: it.fields, ref: i => fieldRef(it.id, i) };
+  const states: { at: number; s: St; current: boolean }[] = [...it.versions.map(v => ({ at: v.at, s: { ...v, ref: (i: number) => ({ id: it.id, src: 'version', at: v.at, idx: i }) } as St, current: false })), { at: it.updated, s: cur, current: true }];
+  type Change = { what: string; from: string; to: string; secret: boolean; fromRef?: SecretRef; toRef?: SecretRef };
+  const diff = (a: St, b: St): Change[] => {
+    const out: Change[] = [];
     const plain: [string, string, string][] = [['Title', a.title, b.title], ['Folder', a.folder, b.folder], ['Tags', a.tags.join(', '), b.tags.join(', ')], ['Notes', a.notes, b.notes], ['Expiry', a.expires, b.expires], ['Category', a.category, b.category]];
     for (const [w, x, y] of plain) if (x !== y) out.push({ what: w, from: x, to: y, secret: false });
     for (const l of new Set([...a.fields.map(f => f.label), ...b.fields.map(f => f.label)])) {
-      const fa = a.fields.find(f => f.label === l), fb = b.fields.find(f => f.label === l);
-      if ((fa?.value ?? '') !== (fb?.value ?? '')) out.push({ what: l || '(unnamed field)', from: fa?.value ?? '', to: fb?.value ?? '', secret: (fa ?? fb)!.kind !== 'text' });
+      const ia = a.fields.findIndex(f => f.label === l), ib = b.fields.findIndex(f => f.label === l);
+      const fa = a.fields[ia], fb = b.fields[ib];
+      if ((fa?.value ?? '') !== (fb?.value ?? '')) out.push({ what: l || '(unnamed field)', from: fa?.value ?? '', to: fb?.value ?? '', secret: (fa ?? fb)!.kind !== 'text',
+        fromRef: fa && isHidden(fa.value) ? a.ref(ia) : undefined, toRef: fb && isHidden(fb.value) ? b.ref(ib) : undefined });
     }
     return out;
   };
   const rows = states.map((st, i) => ({ st, i, changes: i < states.length - 1 ? diff(st.s, states[i + 1].s) : [] }));
   const shown = rows.slice().reverse();
   const list = h('div', { class: 'group vlist' });
-  const vals = (c: { from: string; to: string; secret: boolean }) => {
-    let reveal = false;
+  const vals = (c: Change) => {
+    let shown = false, from = c.from, to = c.to;
     const el = h('span', { class: 'vdiff' });
-    const paint = () => { const m = (v: string) => (c.secret && !reveal ? (v ? '••••••' : '(empty)') : v || '(empty)'); put(el, h('s', {}, m(c.from)), document.createTextNode(' → '), h('b', {}, m(c.to)), c.secret ? iconBtn('eye', 'Show or hide', () => { reveal = !reveal; paint(); }) : null); };
+    const toggle = async () => {
+      try { if (!shown) { if (c.fromRef) from = await reveal(c.fromRef); if (c.toRef) to = await reveal(c.toRef); } } catch (e) { return err(e); }
+      shown = !shown; if (!shown) { from = c.from; to = c.to; } // revealed values are dropped again when hidden
+      paint();
+    };
+    const paint = () => { const m = (v: string) => (c.secret && !shown ? (v ? '••••••' : '(empty)') : v || '(empty)'); put(el, h('s', {}, m(from)), document.createTextNode(' → '), h('b', {}, m(to)), c.secret ? iconBtn('eye', 'Show or hide', toggle) : null); };
     paint();
     return el;
   };
@@ -179,6 +205,61 @@ export function versionsDialog(it: Item) {
       h('div', { class: 'val vlines' }, ...(changes.length ? changes.map(c => h('div', {}, h('em', {}, c.what + ': '), vals(c))) : [h('span', { class: 'hint' }, st.current ? 'This is the current version.' : 'Only formatting changed.')])), h('div', { class: 'acts' }, restore));
   }) : [h('p', { class: 'hint pad' }, 'No earlier versions yet. Every time you change this item, the old state is kept here (the last 25).')]));
   dialog(close => [h('h3', {}, `History of “${it.title}”`), list, h('button', { onclick: close }, 'Close')], 'wide');
+}
+
+// ---------- import ----------
+export function importDialog() {
+  const msg = h('p', { class: 'hint' }, '');
+  const finish = async (n: number, warn = '') => { document.querySelector('dialog.importd')?.remove(); toast(`Imported ${n} item${n === 1 ? '' : 's'}.${warn}`); await hooks.reload(); };
+  const file = (accept: string, fn: (f: File) => Promise<void>) => {
+    const i = h('input', { type: 'file', accept, hidden: true, onchange: async () => { const f = i.files?.[0]; i.value = ''; if (!f) return; msg.textContent = ''; try { await fn(f); } catch (e) { msg.textContent = String(e); } } });
+    return i;
+  };
+  const plainWarn = ' Delete the export file now: it holds your passwords in plain text.';
+  const csv = file('.csv,text/csv', async f => finish(await call<number>('import_csv', { text: await f.text() }), plainWarn));
+  const bw = file('.json,application/json', async f => finish(await call<number>('import_bitwarden', { text: await f.text() }), plainWarn));
+  let kpFile: File | null = null;
+  const kpName = h('b', {}, '');
+  const kpPass = pwField('kppw', 'KeePass master password');
+  const kpGo = h('button', { class: 'primary', onclick: async () => {
+    if (!kpFile) return;
+    kpGo.classList.add('busy'); kpGo.setAttribute('disabled', ''); msg.textContent = 'Opening the database…';
+    try { const n = await call<number>('import_keepass', { data: await b64(kpFile), password: kpPass.input.value }); kpPass.input.value = ''; await finish(n); }
+    catch (e) { msg.textContent = String(e); kpGo.classList.remove('busy'); kpGo.removeAttribute('disabled'); }
+  } }, 'Import');
+  const kpBox = h('div', { class: 'setcol', style: 'display:none' }, h('p', { class: 'hint' }, 'Database: ', kpName), kpPass.wrap, h('div', { class: 'btns' }, kpGo));
+  const kp = file('.kdbx', async f => { kpFile = f; kpName.textContent = f.name; kpBox.style.display = ''; kpPass.input.focus(); });
+  kpPass.input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); kpGo.click(); } });
+  const tile = (ic: string, title: string, sub: string, input: HTMLInputElement) => h('button', { class: 'tile', onclick: () => input.click() }, icon(ic), h('span', {}, h('b', {}, title), h('small', {}, sub)));
+  dialog(close => [h('h3', {}, 'Import'),
+    h('div', { class: 'tiles' },
+      tile('key', 'KeePass database', '.kdbx: groups, custom fields, codes, attachments', kp),
+      tile('shield', 'Bitwarden', 'Export vault as .json (not encrypted): cards, identities, notes, SSH keys', bw),
+      tile('upload', 'CSV file', 'Chrome, Edge, Brave, 1Password, Bitwarden or KeePass CSV export', csv)),
+    kpBox, msg, h('p', { class: 'hint' }, 'Items already in Vault (same title, username, password and code) are skipped.'), csv, bw, kp,
+    h('div', { class: 'btns' }, h('button', { onclick: close }, 'Close'))], 'wide importd');
+}
+
+// ---------- auto-type ----------
+/** Ctrl+Alt+A found several (or no) logins for the window in front: pick one and Vault types it there. */
+export function autotypeDialog(p: { title: string; items: { id: string; title: string; username: string }[]; locked: boolean }, active: () => boolean) {
+  if (p.locked || !active()) { toast('Unlock Vault, then press Ctrl+Alt+A again in the window to type into.', true); return; }
+  document.querySelector('dialog.autotype')?.remove();
+  const go = (id: string) => { document.querySelector('dialog.autotype')?.remove(); call('autotype_item', { id }).catch(err); };
+  const row = (id: string, title: string, sub: string) => h('button', { class: 'row flat', onclick: () => go(id) }, avatar('login', title), h('div', { class: 't' }, h('b', {}, title), h('small', {}, sub)));
+  const q = h('input', { type: 'search', placeholder: 'Or search all logins…', autocomplete: 'off' });
+  const all = h('div', { class: 'group' });
+  const draw = () => {
+    const t = q.value.trim().toLowerCase();
+    const list = S.sums.filter(s => !s.deleted && s.kind === 'login' && (!t || `${s.title} ${s.sub} ${s.domain}`.toLowerCase().includes(t))).slice(0, 8);
+    put(all, ...list.map(s => row(s.id, s.title, s.sub || s.domain)));
+  };
+  q.addEventListener('input', draw);
+  draw();
+  dialog(close => [h('h3', {}, 'Type a login'), h('p', { class: 'hint' }, `Into “${p.title}”. Vault types the username, Tab and the password there.`),
+    p.items.length ? h('div', { class: 'group' }, ...p.items.map(i => row(i.id, i.title, i.username))) : h('p', { class: 'hint' }, 'No login matched this window. Tip: add a field named “Auto-type window” to a login with part of the window title, and next time it is typed straight away.'),
+    q, all, h('div', { class: 'btns' }, h('button', { onclick: close }, 'Cancel'))], 'autotype');
+  q.focus();
 }
 
 // ---------- camera (shared by the 2FA scanner and photo capture) ----------
@@ -424,7 +505,8 @@ export function restoreDialog(onDone: () => void) {
 // ---------- settings ----------
 export async function settingsDialog() {
   const dir = await call<string>('backup_dir');
-  const st = await call<{ quick: boolean; recovery: boolean }>('status');
+  const st = await call<{ quick: boolean; recovery: boolean; hello: boolean }>('status');
+  const helloOk = st.quick && await call<boolean>('hello_available').catch(() => false);
   let autostart = false;
   try { autostart = await call<boolean>('autostart_get'); } catch { /* not available */ }
   const ver = await getVersion().catch(() => '');
@@ -453,8 +535,9 @@ export async function settingsDialog() {
     sec('Locking and sign-in', 'lock',
       choose('Lock after being idle', [[1, '1 minute'], [2, '2 minutes'], [5, '5 minutes'], [15, '15 minutes'], [30, '30 minutes'], [60, '1 hour'], [0, 'Never']], S.settings.autolock_min, v => S.settings.autolock_min = v),
       choose('Clear the clipboard after', [[10, '10 seconds'], [20, '20 seconds'], [30, '30 seconds'], [60, '1 minute'], [0, 'Never']], S.settings.clip_secs, v => S.settings.clip_secs = v),
-      toggle('Lock when Windows locks', 'Locks the vault when you lock your PC (Win+L) or it goes to the lock screen.', S.settings.lock_on_windows_lock, async v => { S.settings.lock_on_windows_lock = v; await saveSettings(); }),
-      toggle('Unlock automatically on this PC', 'Opens straight into the vault when you start the app, and the lock screen needs one click. Anyone using this Windows account can open it.', st.quick, async v => { await call(v ? 'quick_enable' : 'quick_disable'); toast(v ? 'Vault will open automatically on this PC' : 'Vault will ask for the master password'); }, 'quickbox'),
+      toggle('Lock when Windows locks or the PC sleeps', 'Locks the vault when you lock your PC (Win+L), it goes to the lock screen, or it goes to sleep.', S.settings.lock_on_windows_lock, async v => { S.settings.lock_on_windows_lock = v; await saveSettings(); }),
+      toggle('Unlock automatically on this PC', 'Opens straight into the vault when you start the app, and the lock screen needs one click. Anyone using this Windows account can open it.', st.quick, async v => { await call(v ? 'quick_enable' : 'quick_disable'); toast(v ? 'Vault will open automatically on this PC' : 'Vault will ask for the master password'); document.querySelector('dialog.settings')?.remove(); settingsDialog(); }, 'quickbox'),
+      helloOk ? toggle('Ask for Windows Hello first', 'Face, fingerprint or your Windows PIN before the automatic unlock, so someone at your unlocked PC cannot just open Vault.', st.hello, async v => { await call('quick_hello_set', { on: v }); toast(v ? 'Vault will ask for Windows Hello' : 'Windows Hello turned off for Vault'); }, 'hellobox') : null,
       h('div', { class: 'btns' }, h('button', { onclick: () => { close(); recoveryDialog(); } }, icon('shield'), h('span', {}, st.recovery ? 'Recovery key…' : 'Create a recovery key…')), h('button', { onclick: () => { close(); masterDialog(); } }, icon('key'), h('span', {}, 'Change master password…')))),
     sec('Windows', 'grid',
       toggle('Keep running in the tray when the window is closed', 'Quick find (Ctrl+Alt+K) and the browser extension keep working.', S.settings.tray, async v => { S.settings.tray = v; await saveSettings(); }),
@@ -478,6 +561,6 @@ export async function settingsDialog() {
     sec('Updates', 'download', h('p', { class: 'hint' }, `Vault ${ver}. Updates come from GitHub and are checked against a signature.`),
       toggle('Check for updates automatically', '', S.settings.check_updates, async v => { S.settings.check_updates = v; await saveSettings(); }), h('div', { class: 'btns' }, upd)),
     sec('Item templates', 'sparkle', tplList),
-    sec('Shortcuts', 'cmd', h('div', { class: 'keys' }, ...([['Ctrl+Alt+K', 'Quick find from anywhere'], ['Ctrl+K', 'Quick find'], ['Ctrl+N', 'New item'], ['Ctrl+Shift+C', 'Copy password'], ['Ctrl+Shift+U', 'Copy username'], ['Ctrl+Shift+T', 'Copy one-time code'], ['Ctrl+L', 'Lock'], ['/', 'Search'], ['↑ ↓', 'Browse the list']] as [string, string][]).map(([k, d]) => h('div', {}, h('kbd', {}, k), h('span', {}, d))))),
+    sec('Shortcuts', 'cmd', h('div', { class: 'keys' }, ...([['Ctrl+Alt+K', 'Quick find from anywhere'], ['Ctrl+Alt+A', 'Type a login into the window in front'], ['Ctrl+K', 'Quick find'], ['Ctrl+N', 'New item'], ['Ctrl+Shift+C', 'Copy password'], ['Ctrl+Shift+U', 'Copy username'], ['Ctrl+Shift+T', 'Copy one-time code'], ['Ctrl+L', 'Lock'], ['/', 'Search'], ['↑ ↓', 'Browse the list']] as [string, string][]).map(([k, d]) => h('div', {}, h('kbd', {}, k), h('span', {}, d))))),
     h('button', { onclick: close }, 'Close')], 'settings wide');
 }

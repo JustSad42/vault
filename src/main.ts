@@ -3,10 +3,10 @@ import './style.css';
 import './updater';
 import {
   Audit, CATEGORY_COLORS, DOC_TYPES, F, Field, FKind, Item, KIND_ORDER, KINDS, Kind, Live, Ref, Settings, Sum, TEMPLATES, Template, ago, applyTheme, avatar, call, chip, copyBtn, copyText, dialog,
-  err, flashIcon, fromHtml, h, hooks, hue, icon, iconBtn, isImage, meter, put, pwField, S, toast,
+  err, flashIcon, fromHtml, h, hooks, hue, icon, iconBtn, isImage, meter, put, pwField, S, toast, SecretRef, fieldRef, isHidden, reveal, revealCopy,
 } from './kit';
 import {
-  ask, attachFiles, attachmentTile, confirmDialog, forgotDialog, genDialog, restoreDialog, masterDialog, newDialog, photoDialog, saveSettings, searchHelp, settingsDialog, shareDialog, twofaDialog, versionsDialog,
+  ask, attachFiles, attachmentTile, autotypeDialog, confirmDialog, forgotDialog, genDialog, importDialog, restoreDialog, masterDialog, newDialog, photoDialog, saveSettings, searchHelp, settingsDialog, shareDialog, twofaDialog, versionsDialog,
 } from './dialogs';
 import { Block, Inl, parse as parseMd, toggleLine } from './md';
 
@@ -30,8 +30,8 @@ async function showLock(auto = false) {
   ticks.forEach(clearInterval); ticks = [];
   S.sums = []; S.vis = []; S.sel = null; S.editing = null; S.filter = 'all'; S.query = ''; S.qids = null; S.bulk = false; S.picked.clear(); S.pending = [];
   document.querySelectorAll('dialog').forEach(d => d.remove());
-  const { exists, quick, recovery } = await call<{ exists: boolean; quick: boolean; recovery: boolean }>('status');
-  if (auto && exists && quick) { // startup with "stay signed in": straight into the vault
+  const { exists, quick, recovery, hello } = await call<{ exists: boolean; quick: boolean; recovery: boolean; hello: boolean }>('status');
+  if (auto && exists && quick && !hello) { // startup with "stay signed in": straight into the vault (with Windows Hello: on a click, not a surprise prompt at sign-in)
     try { await call('quick_unlock'); return await showMain(); } catch { /* fall back to the password screen */ }
   }
   const pw = pwField('pw1', exists ? (quick ? 'or type your master password' : 'Master password') : 'Choose a master password (10+ characters)');
@@ -39,7 +39,7 @@ async function showLock(auto = false) {
   const m = exists ? null : meter();
   pw.input.addEventListener('input', () => m?.update(pw.input.value));
   const msg = h('p', { class: 'hint', id: 'msg' }, exists ? '' : 'There is no way to recover this password unless you create a recovery key later. Write it down somewhere safe.');
-  const btn = h('button', { type: 'submit', class: 'primary big' }, exists ? 'Unlock' : 'Create vault');
+  const btn = h('button', { type: 'submit', class: 'primary big' }, exists ? (quick && hello ? 'Unlock with Windows Hello' : 'Unlock') : 'Create vault');
   const stay = quick ? null : h('input', { type: 'checkbox', id: 'stay', checked: !exists });
   const stayRow = stay && h('label', { class: 'chk stay' }, stay, h('span', {}, exists ? 'Stay signed in on this PC' : 'Unlock automatically on this PC', h('small', {}, 'Uses your Windows sign-in to protect the key, so anyone using this Windows account can open the vault. You can turn it off in Settings.')));
   const form = h('form', { class: 'card lock' },
@@ -82,19 +82,13 @@ async function showMain() {
   listEl = h('div', { class: 'list' });
   bulkEl = h('div', { class: 'bulkbar', hidden: true });
   detailEl = h('main', { class: 'detail' });
-  const importInput = h('input', { type: 'file', accept: '.csv,text/csv', hidden: true, onchange: async () => {
-    const f = importInput.files?.[0]; if (!f) return;
-    try { const n = await call<number>('import_csv', { text: await f.text() }); toast(`Imported ${n} item${n === 1 ? '' : 's'}. Delete the CSV file now: it holds your passwords in plain text.`); await reload(); }
-    catch (e) { err(e); }
-    importInput.value = '';
-  } });
   const sort = h('select', { 'aria-label': 'Sort', title: 'Sort', onchange: () => { sortBy = sort.value; renderList(true); } },
     h('option', { value: 'name' }, 'A–Z'), h('option', { value: 'recent' }, 'Recent'), h('option', { value: 'category' }, 'Category'), h('option', { value: 'kind' }, 'Type'));
   const side = (name: string, label: string, fn: () => void) => h('button', { class: 'side', onclick: fn }, icon(name), h('span', {}, label));
   layoutEl = h('div', { class: 'layout' },
     h('aside', {}, h('div', { class: 'brand' }, h('div', { class: 'logo sm' }, icon('shield')), h('b', {}, 'Vault')), navEl, h('div', { class: 'grow' }),
-      side('cmd', 'Quick find', palette), side('dice', 'Generator', () => genDialog()), side('upload', 'Import CSV', () => importInput.click()),
-      side('settings', 'Settings', settingsDialog), side('lock', 'Lock', lockNow), importInput),
+      side('cmd', 'Quick find', palette), side('dice', 'Generator', () => genDialog()), side('upload', 'Import', importDialog),
+      side('settings', 'Settings', settingsDialog), side('lock', 'Lock', lockNow)),
     h('section', { class: 'col' },
       h('div', { class: 'bar' }, h('div', { class: 'search' }, icon('search'), searchEl, iconBtn('hash', 'Search tips', searchHelp, 'tipbtn')), h('button', { class: 'primary', onclick: () => newDialog(newItem) }, icon('plus'), h('span', {}, 'New'))),
       h('div', { class: 'bar sub' }, sort, h('button', { class: 'ghost sm', id: 'selbtn', onclick: () => { S.bulk = !S.bulk; S.picked.clear(); renderList(); } }, icon('checksq'), h('span', {}, 'Select'))),
@@ -270,8 +264,8 @@ async function renderDetail() {
     : [iconBtn('star', it.favorite ? 'Remove from favorites' : 'Add to favorites', act(async () => { await call('save_item', { item: { ...it, favorite: !it.favorite } }); await reload(); }), it.favorite ? 'on' : ''),
        iconBtn('history', `Version history (${it.versions.length})`, () => versionsDialog(it)), iconBtn('copy', 'Duplicate', act(async () => { const id = await call<string>('duplicate_item', { id: it.id }); await reload(); openItem(id); toast('Duplicated'); })),
        it.kind !== 'passkey' ? iconBtn('share', 'Share as an encrypted file', () => shareDialog(it)) : null,
-       h('button', { onclick: () => { S.editing = structuredClone(it); S.pending = []; renderDetail(); } }, icon('edit'), h('span', {}, 'Edit'))];
-  const shown = it.fields.filter(f => f.value);
+       h('button', { onclick: act(async () => { const full = await call<Item>('get_item_full', { id: it.id }); S.editing = full; S.pending = []; renderDetail(); }) }, icon('edit'), h('span', {}, 'Edit'))];
+  const shown = it.fields.map((f, i) => ({ f, i })).filter(x => x.f.value);
   const dueIn = it.expires ? Math.floor((Date.parse(it.expires + 'T00:00:00') - Date.now()) / 86400000) + 1 : null;
   const chips = [chip(k.label, k.color, k.icon), auto && chip(auto, CATEGORY_COLORS[auto]), it.folder && chip(it.folder, undefined, 'folder'), ...it.tags.map(t => chip(t, undefined, 'tag')),
     dueIn !== null && chip(dueIn < 0 ? `Expired ${-dueIn} d ago` : dueIn === 0 ? 'Expires today' : `Expires in ${dueIn} d`, dueIn <= 14 ? '#ff6b6b' : '#9aa4b8', 'clock'),
@@ -283,13 +277,13 @@ async function renderDetail() {
     ['card', 'bank'].includes(it.kind) ? walletCard(it) : null,
     it.kind === 'wifi' ? await wifiQr(it) : null,
     it.kind === 'document' ? photos : null,
-    shown.length ? h('div', { class: 'group' }, ...shown.map(viewField)) : null,
+    shown.length ? h('div', { class: 'group' }, ...shown.map(x => viewField(x.f, fieldRef(it.id, x.i)))) : null,
     it.kind === 'identity' ? addressBlock(it) : null,
     it.kind === 'api' ? apiBlock(it) : null,
     it.kind !== 'document' && photos ? h('div', { class: 'sect' }, h('h3', {}, icon('image'), ' Photos and files'), photos) : null,
     it.notes ? h('div', { class: 'group' }, h('div', { class: 'f static' }, h('div', { class: 'l' }, 'Notes'), h('div', { class: 'md' }, ...renderMd(it.notes, async line => { await call('save_item', { item: { ...it, notes: toggleLine(it.notes, line) } }); renderDetail(); })))) : null,
     it.history.length ? h('details', { class: 'group hist' }, h('summary', {}, icon('clock'), ` Earlier passwords and secrets (${it.history.length})`),
-      ...it.history.slice().reverse().map(x => viewField({ label: `Previous ${x.label} · ${ago(x.at)}`, value: x.value, kind: 'secret' }))) : null,
+      ...it.history.map((x, i) => ({ x, i })).reverse().map(({ x, i }) => viewField({ label: `Previous ${x.label} · ${ago(x.at)}`, value: x.value, kind: 'secret' }, { id: it.id, src: 'hist', at: 0, idx: i }))) : null,
     h('small', { class: 'hint foot', title: new Date(it.updated * 1000).toLocaleString() }, 'Changed ' + ago(it.updated)));
 }
 
@@ -319,25 +313,23 @@ function delForever(it: Item) {
 }
 
 async function wifiQr(it: Item) {
-  const g = (l: string) => it.fields.find(f => f.label === l)?.value || '';
-  if (!g('Network name')) return null;
-  try { return h('div', { class: 'qr' }, fromHtml(await call<string>('wifi_qr', { ssid: g('Network name'), password: g('Password'), security: g('Security') })), h('small', { class: 'hint' }, 'Scan with a phone camera to join')); }
+  if (!it.fields.some(f => f.label === 'Network name' && f.value)) return null;
+  try { return h('div', { class: 'qr' }, fromHtml(await call<string>('wifi_qr_item', { id: it.id })), h('small', { class: 'hint' }, 'Scan with a phone camera to join')); }
   catch { return null; }
 }
 
 function walletCard(it: Item) {
-  const g = (l: string) => it.fields.find(f => f.label === l)?.value || '';
+  const g = (l: string) => { const v = it.fields.find(f => f.label === l)?.value || ''; return isHidden(v) ? '' : v; };
+  const tail = S.sums.find(s => s.id === it.id)?.tail || '••••'; // the numbers themselves stay in Rust
   if (it.kind === 'bank') {
-    const acc = g('Account number').replace(/\s/g, ''), iban = g('IBAN').replace(/\s/g, '');
     const w = h('div', { class: 'wallet bank' }, h('div', { class: 'top' }, h('b', {}, g('Bank name') || it.title), icon('bank')),
-      h('div', { class: 'num' }, iban ? iban.slice(0, 4) + ' •••• •••• ' + iban.slice(-4) : '•••• ' + (acc.slice(-4) || '••••')), h('div', { class: 'bot' }, h('span', {}, g('Account holder')), h('span', {}, g('SWIFT / BIC'))));
+      h('div', { class: 'num' }, '•••• •••• ' + tail), h('div', { class: 'bot' }, h('span', {}, g('Account holder')), h('span', {}, g('SWIFT / BIC'))));
     w.style.setProperty('--h', String(hue(it.title)));
     return w;
   }
-  const num = g('Card number').replace(/\D/g, '');
-  const brand = /^4/.test(num) ? 'VISA' : /^(5[1-5]|2[2-7])/.test(num) ? 'Mastercard' : /^3[47]/.test(num) ? 'AMEX' : /^6/.test(num) ? 'Discover' : '';
+  const brand = (g('Brand') || '').toUpperCase();
   const w = h('div', { class: 'wallet' }, h('div', { class: 'top' }, h('i', { class: 'chip' }), h('b', {}, brand)),
-    h('div', { class: 'num' }, '•••• •••• •••• ' + (num.slice(-4) || '••••')), h('div', { class: 'bot' }, h('span', {}, g('Cardholder') || it.title), h('span', {}, g('Expiry'))));
+    h('div', { class: 'num' }, '•••• •••• •••• ' + tail), h('div', { class: 'bot' }, h('span', {}, g('Cardholder') || it.title), h('span', {}, g('Expiry'))));
   w.style.setProperty('--h', String(hue(it.title)));
   return w;
 }
@@ -351,13 +343,15 @@ function addressBlock(it: Item) {
 
 function apiBlock(it: Item) {
   const g = (l: string) => it.fields.find(f => f.label === l)?.value || '';
-  const key = g('Secret key') || g('Key');
-  if (!key) return null;
+  let idx = it.fields.findIndex(f => f.label === 'Secret key' && f.value);
+  if (idx < 0) idx = it.fields.findIndex(f => f.label === 'Key' && f.value);
+  if (idx < 0) return null;
+  const ref = fieldRef(it.id, idx);
   const name = ((g('Service') || it.title).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '') || 'API') + '_API_KEY';
   return h('div', { class: 'sect' }, h('div', { class: 'btns' },
-    h('button', { onclick: () => copyText(`${name}=${key}`) }, icon('terminal'), h('span', {}, `Copy as ${name}=…`)),
-    h('button', { onclick: () => copyText(`export ${name}=${key}`) }, icon('terminal'), h('span', {}, 'Copy as export …')),
-    h('button', { onclick: () => copyText(`$env:${name}="${key}"`) }, icon('terminal'), h('span', {}, 'Copy for PowerShell'))));
+    h('button', { onclick: () => revealCopy(ref, `${name}={v}`) }, icon('terminal'), h('span', {}, `Copy as ${name}=…`)),
+    h('button', { onclick: () => revealCopy(ref, `export ${name}={v}`) }, icon('terminal'), h('span', {}, 'Copy as export …')),
+    h('button', { onclick: () => revealCopy(ref, `$env:${name}="{v}"`) }, icon('terminal'), h('span', {}, 'Copy for PowerShell'))));
 }
 
 function ringEl() {
@@ -374,11 +368,14 @@ function jwt(v: string): any | null {
 
 const groupDigits = (v: string) => v.replace(/\s/g, '').replace(/(.{4})/g, '$1 ').trim();
 
-function viewField(f: Field): HTMLElement {
+/** One field of the item view. Secret values are not in the page: `ref` lets Rust copy or show them on request. */
+function viewField(f: Field, ref: SecretRef): HTMLElement {
   const val = h('div', { class: 'val' });
   const acts = h('div', { class: 'acts' });
   const row = h('div', { class: 'f' }, h('div', { class: 'l' }, f.label), val, acts);
-  let get = () => f.value;
+  const hidden = isHidden(f.value);
+  let get = (): string => (hidden ? '' : f.value);
+  let copy: (() => void) | undefined = hidden ? () => revealCopy(ref) : undefined;
   if (f.kind === 'totp') {
     const ring = ringEl();
     const code = h('span', { class: 'code' });
@@ -392,7 +389,7 @@ function viewField(f: Field): HTMLElement {
       if (busy) return;
       busy = true;
       try {
-        const o = await call<{ code: string; left: number; period: number }>('totp', { secret: f.value });
+        const o = await call<{ code: string; left: number; period: number }>('field_totp', { id: ref.id, idx: ref.idx });
         cur = o.code; code.textContent = `${o.code.slice(0, o.code.length / 2)} ${o.code.slice(o.code.length / 2)}`;
         left = o.left; period = o.period;
         ring.set(o.left, o.period); row.classList.toggle('low', o.left <= 5);
@@ -400,25 +397,36 @@ function viewField(f: Field): HTMLElement {
       busy = false;
     };
     tick(); ticks.push(window.setInterval(tick, 1000));
+    copy = undefined;
   } else {
-    const masked = f.kind === 'secret' || f.kind === 'multiline';
+    const masked = hidden || f.kind === 'secret' || f.kind === 'multiline';
     const grouped = ['IBAN', 'Card number', 'Account number'].includes(f.label);
-    let shown = false;
-    const paint = () => { val.textContent = masked && !shown ? '••••••••••' : grouped ? groupDigits(f.value) : f.value; val.classList.toggle('pre', f.kind === 'multiline' && shown); };
+    let shown = false, value = hidden ? '' : f.value; // a hidden value arrives from Rust only when shown, and is dropped when hidden again
+    const jwtBox = h('pre', { class: 'jwt', hidden: true });
+    const jwtBtn = h('button', { type: 'button', class: 'chipbtn', style: 'display:none', onclick: () => { jwtBox.hidden = !jwtBox.hidden; } }, 'JWT');
+    const paint = () => {
+      val.textContent = masked && !shown ? '••••••••••' : grouped ? groupDigits(value) : value; val.classList.toggle('pre', f.kind === 'multiline' && shown);
+      const claims = !masked || shown ? jwt(value) : null;
+      jwtBtn.style.display = claims ? '' : 'none'; if (!claims) jwtBox.hidden = true; // .chipbtn sets display, so [hidden] alone would not hide it
+      else jwtBox.textContent = JSON.stringify(claims, null, 2) + (typeof claims.exp === 'number' ? `\nexpires ${new Date(claims.exp * 1000).toLocaleString()}` : '');
+    };
     paint();
-    if (masked) { const eye = iconBtn('eye', 'Show or hide', () => { shown = !shown; paint(); put(eye, icon(shown ? 'eyeoff' : 'eye')); }); acts.append(eye); }
-    const claims = jwt(f.value);
-    if (claims) {
-      const box = h('pre', { class: 'jwt', hidden: true }, JSON.stringify(claims, null, 2) + (typeof claims.exp === 'number' ? `\nexpires ${new Date(claims.exp * 1000).toLocaleString()}` : ''));
-      acts.append(h('button', { type: 'button', class: 'chipbtn', onclick: () => { box.hidden = !box.hidden; } }, 'JWT'));
-      row.append(box);
+    if (masked) {
+      const eye = iconBtn('eye', 'Show or hide', async () => {
+        try { if (!shown && hidden) value = await reveal(ref); } catch (e) { return err(e); }
+        shown = !shown; if (!shown && hidden) value = '';
+        paint(); put(eye, icon(shown ? 'eyeoff' : 'eye'));
+      });
+      acts.append(eye);
     }
+    acts.append(jwtBtn); row.append(jwtBox);
   }
-  const cb = copyBtn(() => get());
+  const cb = copyBtn(() => get(), copy);
   acts.append(cb);
   row.addEventListener('click', e => {
     if ((e.target as HTMLElement).closest('.acts, .jwt')) return;
-    if (get()) { copyText(get()); row.classList.add('flash'); setTimeout(() => row.classList.remove('flash'), 500); flashIcon(cb); }
+    if (copy) copy(); else if (get()) copyText(get()); else return;
+    row.classList.add('flash'); setTimeout(() => row.classList.remove('flash'), 500); flashIcon(cb);
   });
   return row;
 }
@@ -596,7 +604,7 @@ function palette() {
     const hits = (ids ?? S.sums.filter(s => !s.deleted).sort(SORTS.name).map(s => s.id)).map(id => byId.get(id)).filter((s): s is Sum => !!s).slice(0, 7);
     const items: Entry[] = hits.map(s => ({
       label: s.title, sub: s.sub || s.domain || KINDS[s.kind].label, ic: KINDS[s.kind].icon, run: () => openItem(s.id),
-      pw: async () => { const it = await call<Item>('get_item', { id: s.id }); const p = it.fields.find(f => f.label === 'Password')?.value; if (p) copyText(p); else toast('This item has no password', true); } }));
+      pw: async () => { const it = await call<Item>('get_item', { id: s.id }); const i = it.fields.findIndex(f => f.label === 'Password' && f.value); if (i >= 0) revealCopy(fieldRef(it.id, i)); else toast('This item has no password', true); } }));
     list = [...items, ...actions.filter(a => !t.trim() || a.label.toLowerCase().includes(t.toLowerCase()))];
     cur = Math.min(cur, Math.max(0, list.length - 1));
     put(res, ...(list.length ? list.map((e, i) => h('button', { class: 'pr' + (i === cur ? ' on' : ''), onclick: () => { d.remove(); e.run(); }, onmousemove: () => { if (cur !== i) { cur = i; res.querySelectorAll('.pr').forEach((x, j) => x.classList.toggle('on', j === cur)); } } },
@@ -613,15 +621,19 @@ function palette() {
 
 async function copyField(label: string) {
   if (!S.sel || S.editing) return;
-  try { const it = await call<Item>('get_item', { id: S.sel }); const v = it.fields.find(f => f.label === label)?.value; if (v) copyText(v); else toast(`This item has no ${label.toLowerCase()}`, true); } catch (e) { err(e); }
+  try {
+    const it = await call<Item>('get_item', { id: S.sel }); const i = it.fields.findIndex(f => f.label === label && f.value);
+    if (i < 0) return toast(`This item has no ${label.toLowerCase()}`, true);
+    if (isHidden(it.fields[i].value)) await revealCopy(fieldRef(it.id, i)); else await copyText(it.fields[i].value);
+  } catch (e) { err(e); }
 }
 
 async function copyCode() {
   if (!S.sel || S.editing) return;
   try {
-    const t = (await call<Item>('get_item', { id: S.sel })).fields.find(f => f.kind === 'totp' && f.value);
-    if (!t) return toast('This item has no one-time code', true);
-    await copyText((await call<{ code: string }>('totp', { secret: t.value })).code);
+    const i = (await call<Item>('get_item', { id: S.sel })).fields.findIndex(f => f.kind === 'totp' && f.value);
+    if (i < 0) return toast('This item has no one-time code', true);
+    await copyText((await call<{ code: string }>('field_totp', { id: S.sel, idx: i })).code);
   } catch (e) { err(e); }
 }
 
@@ -650,5 +662,7 @@ for (const ev of ['mousemove', 'keydown', 'click']) document.addEventListener(ev
 listen('quick-search', () => palette());
 listen('vault-locked', () => { if (S.mainActive) showLock(false); });
 listen('vault-synced', () => { if (S.mainActive && !S.editing) reload(); });
+listen<{ title: string; items: { id: string; title: string; username: string }[]; locked: boolean }>('autotype-pick', e => autotypeDialog(e.payload, () => S.mainActive));
+listen<string>('autotype-error', e => toast(e.payload, true));
 
 showLock(true).catch(e => { app.textContent = String(e); });

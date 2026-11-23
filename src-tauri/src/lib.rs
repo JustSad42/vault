@@ -1,9 +1,11 @@
 mod audit;
+mod autotype;
 mod bridge;
 mod categories;
 mod domain;
 mod extension;
 mod gen;
+mod hello;
 mod import;
 mod native_host;
 mod otp_import;
@@ -15,12 +17,13 @@ mod share;
 mod sync;
 mod totp;
 mod vault;
+mod winevents;
 
 use arboard::{Clipboard, SetExtWindows};
 use serde::Serialize;
 use std::{path::PathBuf, process::{Command, Stdio}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::Duration};
 use tauri::{Emitter, Manager, State};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code as Key, GlobalShortcutExt, Modifiers, ShortcutState};
 use vault::{Item, Session, Settings, KDF};
 
 struct App(Mutex<Option<Session>>);
@@ -85,10 +88,10 @@ fn check_master(pw: &str) -> Result<(), String> {
 }
 
 #[derive(Serialize)]
-struct Status { exists: bool, unlocked: bool, quick: bool, recovery: bool }
+struct Status { exists: bool, unlocked: bool, quick: bool, recovery: bool, hello: bool }
 
 #[derive(Serialize)]
-struct Summary { updated: u64, id: String, kind: String, title: String, sub: String, folder: String, favorite: bool, deleted: bool, tags: Vec<String>, expires: String, files: usize, category: String, domain: String, flags: Vec<&'static str>, versions: usize }
+struct Summary { updated: u64, id: String, kind: String, title: String, sub: String, folder: String, favorite: bool, deleted: bool, tags: Vec<String>, expires: String, files: usize, category: String, domain: String, flags: Vec<&'static str>, versions: usize, tail: String }
 
 #[derive(Serialize)]
 struct Code { code: String, left: u64, period: u64 }
@@ -98,7 +101,7 @@ struct Strength { bits: f64, level: &'static str }
 
 #[tauri::command]
 fn status(st: St) -> Status {
-    Status { exists: vault_path().exists(), unlocked: st.0.lock().unwrap().is_some(), quick: quick_path().exists(), recovery: vault_dir().join("recovery.bin").exists() }
+    Status { exists: vault_path().exists(), unlocked: st.0.lock().unwrap().is_some(), quick: quick_path().exists(), recovery: vault_dir().join("recovery.bin").exists(), hello: quick_hello_on() }
 }
 
 // Argon2 takes a few hundred ms: async commands keep it off the UI thread.
@@ -112,18 +115,46 @@ async fn create_vault(st: St<'_>, password: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn unlock(st: St<'_>, password: String) -> Result<(), String> {
-    let s = Session::open(&vault_path(), &password)?;
+    let mut s = Session::open(&vault_path(), &password)?;
+    // a vault made with a cheaper key derivation is re-encrypted with today's; not being able to is no reason to stay locked
+    if let Ok(true) = s.upgrade_kdf(&password, KDF) { if quick_path().exists() { let _ = quick_write(&s, quick_hello_on()); } }
     *st.0.lock().unwrap() = Some(s);
     Ok(())
 }
 
-fn quick_write(s: &Session) -> Result<(), String> {
-    vault::write_atomic(&quick_path(), &quick::protect(&s.key()[..])?)
+fn quick_write(s: &Session, hello: bool) -> Result<(), String> {
+    vault::write_atomic(&quick_path(), &quick::seal(&s.key()[..], hello)?)
+}
+
+/// "Stay signed in" is on and asks for Windows Hello first.
+fn quick_hello_on() -> bool { std::fs::read(quick_path()).is_ok_and(|b| quick::needs_hello(&b)) }
+
+fn main_hwnd(app: &tauri::AppHandle) -> isize {
+    #[cfg(windows)]
+    { app.get_webview_window("main").and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize).unwrap_or(0) }
+    #[cfg(not(windows))]
+    { let _ = app; 0 }
 }
 
 /// Stay signed in on this PC: needs the vault to be unlocked right now.
 #[tauri::command]
-fn quick_enable(st: St) -> Result<(), String> { with(&st, |s| quick_write(s)) }
+fn quick_enable(st: St) -> Result<(), String> { with(&st, |s| quick_write(s, false)) }
+
+#[tauri::command]
+async fn hello_available() -> bool { tauri::async_runtime::spawn_blocking(hello::available).await.unwrap_or(false) }
+
+/// Turns "ask for Windows Hello" on or off for stay-signed-in. Turning it on checks Hello once, so a broken setup is
+/// found now rather than at the next start.
+#[tauri::command]
+async fn quick_hello_set(app: tauri::AppHandle, st: St<'_>, on: bool) -> Result<(), String> {
+    with(&st, |_| Ok(()))?;
+    if !quick_path().exists() { return Err("turn on stay signed in first".into()); }
+    if on {
+        let h = main_hwnd(&app);
+        tauri::async_runtime::spawn_blocking(move || hello::verify(h, "Confirm it is you to use Windows Hello with Vault")).await.map_err(|e| e.to_string())??;
+    }
+    with(&st, |s| quick_write(s, on))
+}
 
 #[tauri::command]
 fn quick_disable() -> Result<(), String> {
@@ -131,9 +162,13 @@ fn quick_disable() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn quick_unlock(st: St) -> Result<(), String> {
+async fn quick_unlock(app: tauri::AppHandle, st: St<'_>) -> Result<(), String> {
     let blob = std::fs::read(quick_path()).map_err(|_| "quick unlock is not set up".to_string())?;
-    let key = zeroize::Zeroizing::new(quick::unprotect(&blob)?);
+    if quick::needs_hello(&blob) {
+        let h = main_hwnd(&app);
+        tauri::async_runtime::spawn_blocking(move || hello::verify(h, "Unlock Vault")).await.map_err(|e| e.to_string())??;
+    }
+    let key = zeroize::Zeroizing::new(quick::open(&blob)?);
     let key: [u8; 32] = key[..].try_into().map_err(|_| "saved key is damaged".to_string())?;
     let s = Session::open_with_key(&vault_path(), &key)?;
     *st.0.lock().unwrap() = Some(s);
@@ -145,7 +180,7 @@ fn lock(st: St) { *st.0.lock().unwrap() = None; clear_open_dir(); }
 
 #[tauri::command]
 fn list(st: St) -> Result<Vec<Summary>, String> {
-    with(&st, |s| { let fl = audit::flags(&s.data.items, vault::now()); Ok(s.data.items.iter().map(|i| {
+    with(&st, |s| { let fl = s.flags(); Ok(s.data.items.iter().map(|i| {
         let val = |l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
         let sub = match i.kind.as_str() {
             "login" => val("Username"),
@@ -157,15 +192,18 @@ fn list(st: St) -> Result<Vec<Summary>, String> {
             "document" => val("Document type"),
             _ => String::new(),
         };
+        // the last four characters of the card, IBAN or account number: the page shows them on the wallet card without the secret
+        let tail = ["Card number", "IBAN", "Account number"].iter().map(|l| val(l).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()).find(|v| v.len() >= 4)
+            .map(|v| v[v.len() - 4..].to_string()).unwrap_or_default();
         Summary { updated: i.updated, id: i.id.clone(), kind: i.kind.clone(), title: i.title.clone(), sub, folder: i.folder.clone(), favorite: i.favorite, deleted: i.deleted > 0, tags: i.tags.clone(), expires: i.expires.clone(), files: i.attachments.len(), category: categories::of(i),
-            domain: domain::host_of(&categories::website(i)).map(|h| domain::etld1(&h)).unwrap_or_default(), flags: fl.get(&i.id).cloned().unwrap_or_default(), versions: i.versions.len() }
+            domain: domain::host_of(&categories::website(i)).map(|h| domain::etld1(&h)).unwrap_or_default(), flags: fl.get(&i.id).cloned().unwrap_or_default(), versions: i.versions.len(), tail }
     }).collect()) })
 }
 
 /// Ids of matching items, best first (see search.rs for the query language).
 #[tauri::command]
 fn search(st: St, query: String, trash: bool) -> Result<Vec<String>, String> {
-    with(&st, |s| Ok(search::run(&s.data.items, &audit::flags(&s.data.items, vault::now()), &query, trash)))
+    with(&st, |s| Ok(search::run(&s.data.items, &s.flags(), &query, trash)))
 }
 
 #[tauri::command]
@@ -174,13 +212,50 @@ fn restore_version(st: St, id: String, at: u64) -> Result<(), String> { with(&st
 #[tauri::command]
 fn categories_list() -> &'static [&'static str] { categories::ALL }
 
+/// The item for showing: secrets replaced by markers (see `Session::view`); `reveal` fetches one when asked.
 #[tauri::command]
 fn get_item(st: St, id: String) -> Result<Item, String> {
+    with(&st, |s| s.data.items.iter().find(|i| i.id == id).map(|i| s.view(i)).ok_or("item not found".into()))
+}
+
+/// The whole item, secrets included: only for the editor.
+#[tauri::command]
+fn get_item_full(st: St, id: String) -> Result<Item, String> {
     with(&st, |s| s.data.items.iter().find(|i| i.id == id).cloned().ok_or("item not found".into()))
 }
 
 #[tauri::command]
-fn save_item(st: St, item: Item) -> Result<String, String> { with(&st, |s| s.upsert(item)) }
+fn save_item(st: St, mut item: Item) -> Result<String, String> { with(&st, |s| { s.unhide(&mut item)?; s.upsert(item) }) }
+
+/// One secret, on an explicit "show": `src` field | hist | version (see `Session::secret`).
+#[tauri::command]
+fn reveal(st: St, id: String, src: String, at: u64, idx: usize) -> Result<String, String> { with(&st, |s| s.secret(&id, &src, at, idx)) }
+
+/// Copies one secret without it passing through the page. `fmt` may wrap it, `{v}` standing for the value (`export KEY={v}`).
+#[tauri::command]
+fn reveal_copy(st: St, id: String, src: String, at: u64, idx: usize, fmt: Option<String>) -> Result<(), String> {
+    let (v, secs) = with(&st, |s| Ok((s.secret(&id, &src, at, idx)?, s.data.settings.clip_secs)))?;
+    let v = zeroize::Zeroizing::new(match fmt { Some(f) if f.contains("{v}") => f.replace("{v}", &v), _ => v });
+    put_clipboard(&v, secs)
+}
+
+/// The current one-time code of an item's TOTP field.
+#[tauri::command]
+fn field_totp(st: St, id: String, idx: usize) -> Result<Code, String> {
+    let secret = zeroize::Zeroizing::new(with(&st, |s| s.secret(&id, "field", 0, idx))?);
+    totp::code(&secret, vault::now()).map(|o| Code { code: o.code, left: o.left, period: o.period })
+}
+
+/// The join-this-network QR code of a Wi-Fi item, made here so the password stays out of the page.
+#[tauri::command]
+fn wifi_qr_item(st: St, id: String) -> Result<String, String> {
+    let (ssid, pw, sec) = with(&st, |s| {
+        let i = s.data.items.iter().find(|i| i.id == id).ok_or("item not found")?;
+        let g = |l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
+        Ok((g("Network name"), zeroize::Zeroizing::new(g("Password")), g("Security")))
+    })?;
+    qr::wifi(&ssid, &pw, &sec)
+}
 
 /// Moves to the trash; an item already in the trash is deleted for good.
 #[tauri::command]
@@ -202,6 +277,9 @@ fn totp(secret: String) -> Result<Code, String> {
 fn generate(len: usize, lower: bool, upper: bool, digits: bool, symbols: bool) -> Result<String, String> {
     gen::password(len, lower, upper, digits, symbols)
 }
+
+#[tauri::command]
+fn generate_passphrase(words: usize, sep: String, capitalize: bool, number: bool) -> Result<String, String> { gen::passphrase(words, &sep, capitalize, number) }
 
 #[tauri::command]
 fn strength(password: String) -> Strength {
@@ -309,11 +387,26 @@ fn import_csv(st: St, text: String) -> Result<usize, String> {
 }
 
 #[tauri::command]
+fn import_bitwarden(st: St, text: String) -> Result<usize, String> {
+    let items = import::bitwarden_json(&text)?;
+    with(&st, |s| s.add_many(items))
+}
+
+/// `data` is the .kdbx file, base64 encoded. Opening it runs KeePass's own key derivation, so it is kept off the UI thread.
+#[tauri::command]
+async fn import_keepass(st: St<'_>, data: String, password: String) -> Result<usize, String> {
+    let bytes = data_encoding::BASE64.decode(data.trim().as_bytes()).map_err(|_| "could not read the file data".to_string())?;
+    let items = tauri::async_runtime::spawn_blocking(move || import::keepass(&bytes, &password)).await.map_err(|e| e.to_string())??;
+    with(&st, |s| s.add_with_files(items))
+}
+
+#[tauri::command]
 async fn change_password(st: St<'_>, old_password: String, new_password: String) -> Result<(), String> {
     check_master(&new_password)?;
+    let hello = quick_hello_on();
     with(&st, |s| {
         s.change_password(&old_password, &new_password, KDF)?;
-        if quick_path().exists() { quick_write(s)?; } // the key changed: keep quick unlock working
+        if quick_path().exists() { quick_write(s, hello)?; } // the key changed: keep quick unlock working
         Ok(())
     })
 }
@@ -345,7 +438,7 @@ fn recovery_phrase(st: St) -> Result<String, String> { with(&st, |s| Ok(s.data.s
 async fn recover_vault(st: St<'_>, phrase: String, new_password: String) -> Result<(), String> {
     check_master(&new_password)?;
     let s = Session::recover(&vault_path(), &phrase, &new_password, KDF)?;
-    if quick_path().exists() { quick_write(&s)?; }
+    if quick_path().exists() { quick_write(&s, quick_hello_on())?; }
     *st.0.lock().unwrap() = Some(s);
     Ok(())
 }
@@ -442,8 +535,13 @@ fn open_backups() -> Result<(), String> {
 #[tauri::command]
 fn copy(st: St, text: String) -> Result<(), String> {
     let secs = st.0.lock().unwrap().as_ref().map(|s| s.data.settings.clip_secs).unwrap_or(20);
-    Clipboard::new().and_then(|mut c| c.set().exclude_from_history().exclude_from_cloud().text(text.clone())).map_err(|e| e.to_string())?;
+    put_clipboard(&text, secs)
+}
+
+fn put_clipboard(text: &str, secs: u64) -> Result<(), String> {
+    Clipboard::new().and_then(|mut c| c.set().exclude_from_history().exclude_from_cloud().text(text.to_string())).map_err(|e| e.to_string())?;
     if secs > 0 {
+        let text = zeroize::Zeroizing::new(text.to_string());
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
             if let Ok(mut c) = Clipboard::new() {
@@ -452,6 +550,54 @@ fn copy(st: St, text: String) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+// ---------- auto-type ----------
+/// The window that was in front when Ctrl+Alt+A was pressed, waiting for the user to pick a login in Vault.
+static AUTOTYPE_TARGET: Mutex<Option<isize>> = Mutex::new(None);
+
+#[derive(Serialize, Clone)]
+struct Pick { id: String, title: String, username: String }
+
+fn autotype_hotkey(app: &tauri::AppHandle) {
+    let (hwnd, title) = autotype::foreground();
+    if hwnd == 0 || hwnd == main_hwnd(app) { return; }
+    let st = app.state::<App>();
+    let g = st.0.lock().unwrap();
+    let Some(s) = g.as_ref() else {
+        drop(g);
+        *AUTOTYPE_TARGET.lock().unwrap() = Some(hwnd);
+        show(app);
+        let _ = app.emit("autotype-pick", serde_json::json!({ "title": title, "items": [], "locked": true }));
+        return;
+    };
+    let found = autotype::candidates(&s.data.items, &title);
+    let field = |i: &Item, l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
+    if let [one] = found.as_slice() {
+        let (user, pass) = (field(one, "Username"), zeroize::Zeroizing::new(field(one, "Password")));
+        drop(g);
+        let h = app.clone();
+        std::thread::spawn(move || { if let Err(e) = autotype::type_into(hwnd, &user, &pass) { let _ = h.emit("autotype-error", e); } });
+        return;
+    }
+    let items: Vec<Pick> = found.iter().map(|i| Pick { id: i.id.clone(), title: i.title.clone(), username: field(i, "Username") }).collect();
+    drop(g);
+    *AUTOTYPE_TARGET.lock().unwrap() = Some(hwnd);
+    show(app);
+    let _ = app.emit("autotype-pick", serde_json::json!({ "title": title, "items": items, "locked": false }));
+}
+
+/// Types the chosen login into the window that was in front when the hotkey was pressed.
+#[tauri::command]
+async fn autotype_item(app: tauri::AppHandle, st: St<'_>, id: String) -> Result<(), String> {
+    let hwnd = AUTOTYPE_TARGET.lock().unwrap().take().ok_or("press Ctrl+Alt+A in the window to type into first")?;
+    let (user, pass) = with(&st, |s| {
+        let i = s.data.items.iter().find(|i| i.id == id && i.deleted == 0).ok_or("item not found")?;
+        let g = |l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
+        Ok((g("Username"), zeroize::Zeroizing::new(g("Password"))))
+    })?;
+    if let Some(w) = app.get_webview_window("main") { let _ = w.minimize(); }
+    tauri::async_runtime::spawn_blocking(move || autotype::type_into(hwnd, &user, &pass)).await.map_err(|e| e.to_string())?
 }
 
 // ---------- sync with the user's own server ----------
@@ -588,14 +734,21 @@ fn show(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") { let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus(); }
 }
 
+/// `VAULT_TEST_COPY=1` (with its own `VAULT_DIR`): an end-to-end test copy that can run next to the real Vault. It
+/// skips the single-instance hand-off, the global hotkeys and the browser's native-host registration, which all
+/// belong to the real app.
+fn test_copy() -> bool { std::env::var_os("VAULT_TEST_COPY").is_some() }
+
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
+    let mut builder = tauri::Builder::default();
+    if !test_copy() { builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| show(app))); }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, ev| {
-            if ev.state() == ShortcutState::Pressed { show(app); let _ = app.emit("quick-search", ()); }
+        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, sc, ev| {
+            if ev.state() != ShortcutState::Pressed { return; }
+            if sc.matches(Modifiers::CONTROL | Modifiers::ALT, Key::KeyA) { autotype_hotkey(app); } else { show(app); let _ = app.emit("quick-search", ()); }
         }).build())
         .manage(App(Mutex::new(None)))
         .on_window_event(|w, ev| {
@@ -607,8 +760,11 @@ pub fn run() {
             clear_open_dir();
             prefs_load();
             { let h = app.handle().clone(); std::thread::spawn(move || bridge::serve(h)); }
-            std::thread::spawn(|| extension::register_native_host(&vault_dir(), &std::env::var("VAULT_NATIVE_HOST_NAME").unwrap_or_else(|_| "local.vault".into())));
-            let _ = app.global_shortcut().register("ctrl+alt+k"); // already taken by another app: not fatal
+            if !test_copy() {
+                std::thread::spawn(|| extension::register_native_host(&vault_dir(), &std::env::var("VAULT_NATIVE_HOST_NAME").unwrap_or_else(|_| "local.vault".into())));
+                let _ = app.global_shortcut().register("ctrl+alt+k"); // already taken by another app: not fatal
+                let _ = app.global_shortcut().register("ctrl+alt+a"); // auto-type
+            }
             // tray icon: Open / Lock / Quit
             let open = tauri::menu::MenuItem::with_id(app, "open", "Open Vault", true, None::<&str>)?;
             let lock = tauri::menu::MenuItem::with_id(app, "lock", "Lock", true, None::<&str>)?;
@@ -629,21 +785,24 @@ pub fn run() {
                     if on && (sync::pending(&vault_dir()) || last.elapsed() > Duration::from_secs(120)) { last = std::time::Instant::now(); let _ = sync_guarded(&hs); }
                 }
             });
-            // lock the vault when Windows locks
+            // lock the vault when Windows locks or the PC goes to sleep: told by Windows, or (if that cannot be set up) by polling
             let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let mut was = false;
-                loop {
-                    std::thread::sleep(Duration::from_millis(1500));
-                    let now = workstation_locked();
-                    if now && !was && LOCK_ON_WINDOWS_LOCK.load(Ordering::Relaxed) { lock_now(&handle); }
-                    was = now;
-                }
-            });
+            let evh = handle.clone();
+            if !winevents::watch(move || { if LOCK_ON_WINDOWS_LOCK.load(Ordering::Relaxed) { lock_now(&evh); } }) {
+                std::thread::spawn(move || {
+                    let mut was = false;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let now = workstation_locked();
+                        if now && !was && LOCK_ON_WINDOWS_LOCK.load(Ordering::Relaxed) { lock_now(&handle); }
+                        was = now;
+                    }
+                });
+            }
             if std::env::args().any(|a| a == "--minimized") { if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); } }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![sync_status, sync_enable, sync_disable, sync_key, sync_now, sync_restore, bridge_pair_start, bridge_paired, bridge_revoke, extension_install, status, create_vault, unlock, quick_enable, quick_disable, quick_unlock, lock, list, get_item, save_item, delete_item, restore_item, empty_trash,
+        .invoke_handler(tauri::generate_handler![get_item_full, reveal, reveal_copy, field_totp, wifi_qr_item, generate_passphrase, import_bitwarden, import_keepass, hello_available, quick_hello_set, autotype_item, sync_status, sync_enable, sync_disable, sync_key, sync_now, sync_restore, bridge_pair_start, bridge_paired, bridge_revoke, extension_install, status, create_vault, unlock, quick_enable, quick_disable, quick_unlock, lock, list, get_item, save_item, delete_item, restore_item, empty_trash,
             totp, totp_all, search, restore_version, categories_list, autostart_get, autostart_set, recovery_enable, recovery_phrase, recover_vault, att_add, att_data, att_open, att_save, att_remove, bulk, duplicate_item, list_backups, restore_backup, share_save, share_load, parse_2fa, scan_screen, scan_image, scan_luma, import_items, export_backup, generate, strength, security_audit, breach_check, wifi_qr, import_csv, change_password, get_settings, set_settings, backup_dir, open_backups, copy])
         .build(tauri::generate_context!())
         .expect("error while building Vault")

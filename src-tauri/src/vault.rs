@@ -5,8 +5,9 @@ use chacha20poly1305::{aead::{Aead, Payload}, Key, KeyInit, XChaCha20Poly1305, X
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Write, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
-use zeroize::Zeroizing;
+use hmac::{Hmac, Mac};
+use std::{cell::RefCell, collections::HashMap, fs, io::Write, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"VLT1";
 const HDR: usize = 32; // magic 4 + m,t,p 12 + salt 16
@@ -17,6 +18,14 @@ const KEEP_HISTORY: usize = 20;
 const KEEP_VERSIONS: usize = 25;
 const MAX_ATT: usize = 25 * 1024 * 1024;
 const RMAGIC: &[u8; 4] = b"VRC1";
+/// Permanent deletes are remembered this long so a sync merge does not bring the item back.
+const KEEP_PURGED_DAYS: u64 = 365;
+
+/// What the page gets instead of a secret value: a marker plus a keyed fingerprint, so it can tell values apart
+/// (version diffs) and send an unchanged item back without ever holding the secret. See `Session::view` / `unhide`.
+pub const HIDDEN: &str = "\u{1}hidden:";
+
+type Flags = HashMap<String, Vec<&'static str>>;
 
 #[derive(Clone, Copy)]
 pub struct Kdf { pub m: u32, pub t: u32, pub p: u32 }
@@ -26,14 +35,14 @@ pub const KDF: Kdf = Kdf { m: 65536, t: 3, p: 1 };
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct Field { pub label: String, pub value: String, pub kind: String } // kind: text | secret | totp
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct Hist { pub label: String, pub value: String, pub at: u64 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Att { pub id: String, pub name: String, pub size: u64 }
 
 /// A past state of an item: everything you can edit, as it was before a change.
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct ItemVersion { pub at: u64, pub title: String, pub folder: String, pub tags: Vec<String>, pub notes: String, pub expires: String, pub category: String, pub fields: Vec<Field> }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -62,7 +71,18 @@ impl Item {
     fn same_content(&self, o: &Item) -> bool {
         (&self.title, &self.folder, &self.tags, &self.notes, &self.expires, &self.category, &self.fields) == (&o.title, &o.folder, &o.tags, &o.notes, &o.expires, &o.category, &o.fields)
     }
+    fn matches(&self, v: &ItemVersion) -> bool {
+        (&self.title, &self.folder, &self.tags, &self.notes, &self.expires, &self.category, &self.fields) == (&v.title, &v.folder, &v.tags, &v.notes, &v.expires, &v.category, &v.fields)
+    }
+    fn push_version(&mut self, v: ItemVersion) {
+        self.versions.push(v);
+        self.versions.drain(..self.versions.len().saturating_sub(KEEP_VERSIONS));
+    }
 }
+
+/// An item deleted for good, so that merging with another PC's older copy does not resurrect it.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct Purged { pub id: String, pub at: u64 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Paired { pub name: String, pub hash: String, pub created: u64 }
@@ -99,7 +119,16 @@ impl Default for Settings {
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Data {
     pub items: Vec<Item>,
+    #[serde(default)] pub purged: Vec<Purged>,
     #[serde(default)] pub settings: Settings,
+}
+
+impl Data {
+    fn record_purge(&mut self, ids: impl IntoIterator<Item = String>) {
+        let t = now();
+        for id in ids { self.purged.retain(|p| p.id != id); self.purged.push(Purged { id, at: t }); }
+        self.purged.retain(|p| t.saturating_sub(p.at) < KEEP_PURGED_DAYS * 86400);
+    }
 }
 
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
@@ -226,16 +255,56 @@ pub fn read_data(bytes: &[u8], key: &[u8; 32]) -> Result<Data, String> { read_he
 /// Encrypts `data` with the same key, salt and cost as the vault file in `like`, so the result opens with the same master password.
 pub fn reseal(like: &[u8], key: &[u8; 32], data: &Data) -> Result<Vec<u8>, String> { let (kdf, salt) = read_header(like)?; seal(key, &salt, kdf, data) }
 
-/// Two copies of one vault that were changed on different PCs: every item once, the more recently changed copy wins; settings stay local.
-pub fn merge_data(local: Data, remote: Data) -> Data {
-    let mut by_id: std::collections::HashMap<String, Item> = remote.items.into_iter().map(|i| (i.id.clone(), i)).collect();
-    for l in local.items { match by_id.get(&l.id) { Some(r) if r.updated > l.updated => {} _ => { by_id.insert(l.id.clone(), l); } } }
-    let mut items: Vec<Item> = by_id.into_values().collect();
-    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
-    Data { items, settings: local.settings }
+/// Folds the losing copy of an item into the winner's history, so an edit made on the other PC is never just gone.
+fn absorb(win: &mut Item, lose: Item) {
+    let mut versions = std::mem::take(&mut win.versions);
+    if !win.same_content(&lose) { let s = lose.snapshot(); if !versions.contains(&s) { versions.push(s); } }
+    for v in lose.versions { if !versions.contains(&v) { versions.push(v); } }
+    versions.sort_by_key(|v| v.at);
+    versions.drain(..versions.len().saturating_sub(KEEP_VERSIONS));
+    win.versions = versions;
+    for h in lose.history { if !win.history.contains(&h) { win.history.push(h); } }
+    win.history.sort_by_key(|h| h.at);
+    win.history.drain(..win.history.len().saturating_sub(KEEP_HISTORY));
 }
 
-pub struct Session { key: Zeroizing<[u8; 32]>, salt: [u8; 16], kdf: Kdf, pub data: Data, path: PathBuf }
+/// Two copies of one vault that were changed on different PCs: every item once, the more recently changed copy wins
+/// (the other one goes into its version history), items deleted for good on either PC stay deleted; settings stay local.
+pub fn merge_data(local: Data, remote: Data) -> Data {
+    let mut purged: HashMap<String, u64> = HashMap::new();
+    for p in remote.purged.iter().chain(local.purged.iter()) { let e = purged.entry(p.id.clone()).or_insert(0); *e = (*e).max(p.at); }
+    let mut by_id: HashMap<String, Item> = remote.items.into_iter().map(|i| (i.id.clone(), i)).collect();
+    for l in local.items {
+        let merged = match by_id.remove(&l.id) {
+            None => l,
+            Some(r) => { let (mut win, lose) = if r.updated > l.updated { (r, l) } else { (l, r) }; absorb(&mut win, lose); win }
+        };
+        by_id.insert(merged.id.clone(), merged);
+    }
+    // an edit made after the delete (on a PC that had not heard of it yet) keeps the item
+    let mut items: Vec<Item> = by_id.into_values().filter(|i| purged.get(&i.id).is_none_or(|&at| i.updated > at)).collect();
+    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
+    let t = now();
+    let mut purged: Vec<Purged> = purged.into_iter().filter(|(_, at)| t.saturating_sub(*at) < KEEP_PURGED_DAYS * 86400).map(|(id, at)| Purged { id, at }).collect();
+    purged.sort_by(|a, b| a.id.cmp(&b.id));
+    Data { items, purged, settings: local.settings }
+}
+
+pub struct Session { key: Zeroizing<[u8; 32]>, salt: [u8; 16], kdf: Kdf, pub data: Data, path: PathBuf, flags: RefCell<Option<(u64, Flags)>> }
+
+/// Locking drops the session: overwrite the secrets in memory instead of just freeing them.
+impl Drop for Session {
+    fn drop(&mut self) {
+        for i in &mut self.data.items {
+            for f in &mut i.fields { f.value.zeroize(); }
+            i.notes.zeroize();
+            for h in &mut i.history { h.value.zeroize(); }
+            for v in &mut i.versions { v.notes.zeroize(); for f in &mut v.fields { f.value.zeroize(); } }
+        }
+        self.data.settings.sync_token.zeroize();
+        self.data.settings.recovery_phrase.zeroize();
+    }
+}
 
 impl Session {
     pub fn create(path: &Path, pw: &str, kdf: Kdf) -> Result<Self, String> {
@@ -243,7 +312,7 @@ impl Session {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
         let key = derive(pw, &salt, kdf)?;
-        let s = Session { key, salt, kdf, data: Data::default(), path: path.to_path_buf() };
+        let s = Session { key, salt, kdf, data: Data::default(), path: path.to_path_buf(), flags: RefCell::new(None) };
         s.save()?;
         Ok(s)
     }
@@ -264,8 +333,69 @@ impl Session {
 
     fn load(path: &Path, b: &[u8], key: Zeroizing<[u8; 32]>, kdf: Kdf, salt: [u8; 16]) -> Result<Self, String> {
         let mut data = decrypt(&key, b)?;
-        data.items.retain(|i| i.deleted == 0 || now().saturating_sub(i.deleted) < TRASH_DAYS * 86400);
-        Ok(Session { key, salt, kdf, data, path: path.to_path_buf() })
+        let old: Vec<String> = data.items.iter().filter(|i| i.deleted != 0 && now().saturating_sub(i.deleted) >= TRASH_DAYS * 86400).map(|i| i.id.clone()).collect();
+        if !old.is_empty() { data.items.retain(|i| !old.contains(&i.id)); data.record_purge(old); }
+        Ok(Session { key, salt, kdf, data, path: path.to_path_buf(), flags: RefCell::new(None) })
+    }
+
+    /// Smart-filter markers per item, computed once per save (and per day, for "old" and "expiring").
+    pub fn flags(&self) -> std::cell::Ref<'_, Flags> {
+        let day = now() / 86400;
+        if self.flags.borrow().as_ref().map(|c| c.0) != Some(day) { *self.flags.borrow_mut() = Some((day, crate::audit::flags(&self.data.items, now()))); }
+        std::cell::Ref::map(self.flags.borrow(), |c| &c.as_ref().expect("filled above").1)
+    }
+
+    /// The vault was made with a cheaper key derivation than `target` (an older Vault): re-encrypt with `target`
+    /// now that the password is at hand. Returns true when the key changed.
+    pub fn upgrade_kdf(&mut self, pw: &str, target: Kdf) -> Result<bool, String> {
+        if self.kdf.m >= target.m && self.kdf.t >= target.t && self.kdf.p >= target.p { return Ok(false); }
+        if *derive(pw, &self.salt, self.kdf)? != *self.key { return Err("wrong password".into()); }
+        self.set_password(pw, target)?;
+        Ok(true)
+    }
+
+    fn fingerprint(&self, v: &str) -> String {
+        let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&*self.key).expect("any key length works");
+        Mac::update(&mut m, b"vault view v1\0");
+        Mac::update(&mut m, v.as_bytes());
+        data_encoding::HEXLOWER.encode(&m.finalize().into_bytes()[..8])
+    }
+    fn hide(&self, v: &mut String) { if !v.is_empty() { *v = format!("{HIDDEN}{}", self.fingerprint(v)); } }
+
+    /// The item as the page may see it: every non-text value (passwords, keys, codes, earlier passwords, secrets in
+    /// old versions) replaced by `HIDDEN` + fingerprint. The page asks for one value at a time with `secret`.
+    pub fn view(&self, i: &Item) -> Item {
+        let mut c = i.clone();
+        for f in c.fields.iter_mut().filter(|f| f.kind != "text") { self.hide(&mut f.value); }
+        for h in &mut c.history { self.hide(&mut h.value); }
+        for v in &mut c.versions { for f in v.fields.iter_mut().filter(|f| f.kind != "text") { self.hide(&mut f.value); } }
+        c
+    }
+
+    /// Puts the real values back into an item the page sends that still carries hidden markers (a favorite toggle, a
+    /// ticked checklist): each marker is matched by fingerprint against the stored item.
+    pub fn unhide(&self, item: &mut Item) -> Result<(), String> {
+        if !item.fields.iter().any(|f| f.value.starts_with(HIDDEN)) { return Ok(()); }
+        let stored = self.data.items.iter().find(|i| !item.id.is_empty() && i.id == item.id).ok_or("hidden values can only be saved back to their own item")?;
+        for f in item.fields.iter_mut().filter(|f| f.value.starts_with(HIDDEN)) {
+            let want = &f.value[HIDDEN.len()..];
+            let real = stored.fields.iter().map(|f| &f.value).chain(stored.versions.iter().flat_map(|v| v.fields.iter().map(|f| &f.value))).chain(stored.history.iter().map(|h| &h.value))
+                .find(|v| self.fingerprint(v) == want).ok_or("a hidden value changed in the meantime; open the item again")?;
+            f.value = real.clone();
+        }
+        Ok(())
+    }
+
+    /// One secret value: `src` is "field" (index into fields), "hist" (index into history) or "version" (version `at`, field index).
+    pub fn secret(&self, id: &str, src: &str, at: u64, idx: usize) -> Result<String, String> {
+        let i = self.data.items.iter().find(|i| i.id == id).ok_or("item not found")?;
+        let v = match src {
+            "field" => i.fields.get(idx).map(|f| &f.value),
+            "hist" => i.history.get(idx).map(|h| &h.value),
+            "version" => i.versions.iter().find(|v| v.at == at).and_then(|v| v.fields.get(idx)).map(|f| &f.value),
+            _ => return Err("unknown value".into()),
+        };
+        v.cloned().ok_or_else(|| "that value no longer exists".into())
     }
 
     pub fn key(&self) -> Zeroizing<[u8; 32]> { Zeroizing::new(*self.key) }
@@ -284,6 +414,7 @@ impl Session {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        self.flags.replace(None);
         let bytes = seal(&self.key, &self.salt, self.kdf, &self.data)?;
         if self.path.exists() { self.backup(); }
         write_atomic(&self.path, &bytes)?;
@@ -314,10 +445,8 @@ impl Session {
             item.history = hist;
             item.deleted = slot.deleted;
             item.attachments = slot.attachments.clone();
-            let mut versions = slot.versions.clone();
-            if !slot.same_content(&item) { versions.push(slot.snapshot()); }
-            versions.drain(..versions.len().saturating_sub(KEEP_VERSIONS));
-            item.versions = versions;
+            item.versions = slot.versions.clone();
+            if !slot.same_content(&item) { item.push_version(slot.snapshot()); }
             *slot = item.clone();
         }
         self.save()?;
@@ -328,7 +457,7 @@ impl Session {
     pub fn remove(&mut self, id: &str) -> Result<(), String> {
         let it = self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?;
         // bumping `updated` lets a sync merge carry the trashing over to other PCs
-        if it.deleted == 0 { it.deleted = now(); it.updated = it.deleted; } else { self.data.items.retain(|i| i.id != id); }
+        if it.deleted == 0 { it.deleted = now(); it.updated = it.deleted; } else { self.data.items.retain(|i| i.id != id); self.data.record_purge([id.to_string()]); }
         self.save()
     }
 
@@ -340,19 +469,23 @@ impl Session {
     }
 
     pub fn empty_trash(&mut self) -> Result<usize, String> {
-        let before = self.data.items.len();
+        let gone: Vec<String> = self.data.items.iter().filter(|i| i.deleted != 0).map(|i| i.id.clone()).collect();
         self.data.items.retain(|i| i.deleted == 0);
+        let n = gone.len();
+        self.data.record_purge(gone);
         self.save()?;
-        Ok(before - self.data.items.len())
+        Ok(n)
+    }
+
+    fn is_duplicate(&self, it: &Item) -> bool {
+        let field = |i: &Item, l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
+        self.data.items.iter().any(|e| e.deleted == 0 && e.title == it.title && ["Username", "Password", "One-time code"].iter().all(|l| field(e, l) == field(it, l)))
     }
 
     pub fn add_many(&mut self, items: Vec<Item>) -> Result<usize, String> {
-        let field = |i: &Item, l: &str| i.fields.iter().find(|f| f.label == l).map(|f| f.value.clone()).unwrap_or_default();
         let mut n = 0;
         for mut it in items {
-            let same = |e: &Item| e.deleted == 0 && e.title == it.title && ["Username", "Password", "One-time code"].iter().all(|l| field(e, l) == field(&it, l));
-            let dup = self.data.items.iter().any(same);
-            if dup { continue; }
+            if self.is_duplicate(&it) { continue; }
             it.id = new_id();
             it.updated = now();
             self.data.items.push(it);
@@ -417,8 +550,18 @@ impl Session {
     fn att_dir(&self) -> PathBuf { self.path.with_file_name("attachments") }
 
     pub fn att_add(&mut self, item_id: &str, name: &str, bytes: &[u8]) -> Result<Att, String> {
-        if bytes.len() > MAX_ATT { return Err("files can be at most 25 MB".into()); }
         if !self.data.items.iter().any(|i| i.id == item_id) { return Err("item not found".into()); }
+        let att = self.att_write(name, bytes)?;
+        let it = self.data.items.iter_mut().find(|i| i.id == item_id).unwrap();
+        it.attachments.push(att.clone());
+        it.updated = now();
+        self.save()?;
+        Ok(att)
+    }
+
+    /// Encrypts one file into attachments/ and describes it; the caller links it to an item and saves.
+    fn att_write(&self, name: &str, bytes: &[u8]) -> Result<Att, String> {
+        if bytes.len() > MAX_ATT { return Err("files can be at most 25 MB".into()); }
         let id = new_id();
         let mut nonce = [0u8; NONCE];
         OsRng.fill_bytes(&mut nonce);
@@ -427,12 +570,22 @@ impl Session {
         let mut out = nonce.to_vec();
         out.extend_from_slice(&ct);
         write_atomic(&self.att_dir().join(format!("{id}.bin")), &out)?;
-        let att = Att { id, name: name.rsplit(['\\', '/']).next().unwrap_or(name).to_string(), size: bytes.len() as u64 };
-        let it = self.data.items.iter_mut().find(|i| i.id == item_id).unwrap();
-        it.attachments.push(att.clone());
-        it.updated = now();
-        self.save()?;
-        Ok(att)
+        Ok(Att { id, name: name.rsplit(['\\', '/']).next().unwrap_or(name).to_string(), size: bytes.len() as u64 })
+    }
+
+    /// Imports items that come with files (KeePass attachments); skips ones already in the vault like `add_many`.
+    pub fn add_with_files(&mut self, items: Vec<(Item, Vec<(String, Vec<u8>)>)>) -> Result<usize, String> {
+        let mut n = 0;
+        for (mut it, files) in items {
+            if self.is_duplicate(&it) { continue; }
+            it.attachments = files.iter().map(|(name, b)| self.att_write(name, b)).collect::<Result<_, _>>()?;
+            it.id = new_id();
+            it.updated = now();
+            self.data.items.push(it);
+            n += 1;
+        }
+        if n > 0 { self.save()?; }
+        Ok(n)
     }
 
     pub fn att_get(&self, att_id: &str) -> Result<Vec<u8>, String> {
@@ -467,6 +620,7 @@ impl Session {
         let t = now();
         let mut n = 0;
         for it in self.data.items.iter_mut().filter(|i| ids.contains(&i.id)) {
+            let before = it.snapshot();
             match op {
                 "folder" => it.folder = value.trim().to_string(),
                 "favorite" => it.favorite = true,
@@ -476,6 +630,7 @@ impl Session {
                 "tag" => { let v = value.trim(); if !v.is_empty() && !it.tags.iter().any(|x| x == v) { it.tags.push(v.to_string()); } }
                 _ => it.tags.retain(|x| x != value.trim()),
             }
+            if !it.matches(&before) { it.push_version(before); } // folder and tag changes can be undone like edits
             it.updated = t;
             n += 1;
         }
@@ -487,11 +642,7 @@ impl Session {
     pub fn restore_version(&mut self, id: &str, at: u64) -> Result<(), String> {
         let it = self.data.items.iter_mut().find(|i| i.id == id).ok_or("item not found")?;
         let v = it.versions.iter().find(|v| v.at == at).cloned().ok_or("that version no longer exists")?;
-        if !it.same_content(&Item { title: v.title.clone(), folder: v.folder.clone(), tags: v.tags.clone(), notes: v.notes.clone(), expires: v.expires.clone(), category: v.category.clone(), fields: v.fields.clone(), ..Default::default() }) {
-            let cur = it.snapshot();
-            it.versions.push(cur);
-            it.versions.drain(..it.versions.len().saturating_sub(KEEP_VERSIONS));
-        }
+        if !it.matches(&v) { let cur = it.snapshot(); it.push_version(cur); }
         (it.title, it.folder, it.tags, it.notes, it.expires, it.category, it.fields) = (v.title, v.folder, v.tags, v.notes, v.expires, v.category, v.fields);
         it.updated = now().max(it.updated + 1); // a distinct timestamp so the restored state is its own point in time
         self.save()
@@ -628,6 +779,130 @@ mod tests {
         let live = Data { items: vec![Item { updated: 5, ..s.data.items[0].clone() }], ..Default::default() };
         s.remove(&id).unwrap();
         assert!(merge_data(s.data.clone(), live).items[0].deleted > 0);
+    }
+
+    #[test]
+    fn deletes_for_good_stay_deleted_through_a_merge() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let a = s.upsert(item("A")).unwrap();
+        let b = s.upsert(item("B")).unwrap();
+        let other_pc = s.data.clone(); // the other PC still has both
+        s.remove(&a).unwrap();
+        s.remove(&a).unwrap(); // for good
+        s.remove(&b).unwrap();
+        s.empty_trash().unwrap();
+        assert_eq!(s.data.purged.len(), 2);
+        let m = merge_data(s.data.clone(), other_pc.clone());
+        assert!(m.items.is_empty() && m.purged.len() == 2, "neither comes back");
+        let m = merge_data(other_pc.clone(), s.data.clone());
+        assert!(m.items.is_empty(), "either direction");
+        // edited on the other PC after the delete: kept
+        let mut later = other_pc;
+        later.items[0].updated = now() + 10;
+        assert_eq!(merge_data(s.data.clone(), later).items.len(), 1);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_losing_edit_as_a_version() {
+        let base = Item { id: "1".into(), kind: "login".into(), title: "Bank".into(), updated: 10, ..Default::default() };
+        let mut mine = base.clone();
+        mine.title = "Bank (mine)".into();
+        mine.updated = 20;
+        let mut theirs = base.clone();
+        theirs.title = "Bank (theirs)".into();
+        theirs.updated = 30;
+        theirs.versions = vec![base.snapshot()];
+        let m = merge_data(Data { items: vec![mine], ..Default::default() }, Data { items: vec![theirs], ..Default::default() });
+        let it = &m.items[0];
+        assert_eq!(it.title, "Bank (theirs)");
+        assert_eq!(it.versions.iter().map(|v| v.title.as_str()).collect::<Vec<_>>(), ["Bank", "Bank (mine)"]);
+        // the same item on both sides: nothing added
+        let m2 = merge_data(m.clone(), m.clone());
+        assert_eq!(m2.items[0].versions.len(), 2);
+    }
+
+    #[test]
+    fn bulk_folder_and_tag_changes_are_versioned() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let a = s.upsert(item("A")).unwrap();
+        s.bulk(&[a.clone()], "folder", "Work").unwrap();
+        s.bulk(&[a.clone()], "favorite", "").unwrap(); // not part of a version
+        s.bulk(&[a.clone()], "tag", "x").unwrap();
+        let v = &s.data.items[0].versions;
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].folder.as_str(), v[1].folder.as_str()), ("", "Work"));
+    }
+
+    #[test]
+    fn the_page_view_hides_secrets_and_saves_back_safely() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let mut it = item("Site");
+        let f = |l: &str, v: &str, k: &str| Field { label: l.into(), value: v.into(), kind: k.into() };
+        it.fields = vec![f("Username", "me", "text"), f("Password", "one", "secret"), f("One-time code", "JBSWY3DPEHPK3PXP", "totp")];
+        let id = s.upsert(it).unwrap();
+        let mut e = s.data.items[0].clone();
+        e.fields[1].value = "two".into();
+        s.upsert(e).unwrap();
+        let v = s.view(&s.data.items[0]);
+        assert_eq!(v.fields[0].value, "me");
+        assert!(v.fields[1].value.starts_with(HIDDEN) && v.fields[2].value.starts_with(HIDDEN));
+        assert!(v.history[0].value.starts_with(HIDDEN) && v.versions[0].fields[1].value.starts_with(HIDDEN));
+        assert_ne!(v.versions[0].fields[1].value, v.fields[1].value, "a changed secret looks different");
+        assert!(!serde_json::to_string(&v).unwrap().contains("two"));
+        assert_eq!(s.secret(&id, "field", 0, 1).unwrap(), "two");
+        assert_eq!(s.secret(&id, "hist", 0, 0).unwrap(), "one");
+        let at = v.versions[0].at;
+        assert_eq!(s.secret(&id, "version", at, 1).unwrap(), "one");
+        // a favorite toggle sent back with hidden values keeps the real ones
+        let mut back = v.clone();
+        back.favorite = true;
+        s.unhide(&mut back).unwrap();
+        s.upsert(back).unwrap();
+        assert_eq!(s.data.items[0].fields[1].value, "two");
+        assert!(s.data.items[0].favorite);
+        // a forged marker is refused
+        let mut bad = s.view(&s.data.items[0]);
+        bad.fields[1].value = format!("{HIDDEN}0000000000000000");
+        assert!(s.unhide(&mut bad).is_err());
+        let mut new = item("New");
+        new.fields = v.fields.clone();
+        assert!(s.unhide(&mut new).is_err(), "markers cannot be moved to another item");
+    }
+
+    #[test]
+    fn a_cheaper_kdf_is_upgraded_on_unlock() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw-12345678", FAST).unwrap();
+        s.upsert(item("A")).unwrap();
+        s.enable_recovery().unwrap();
+        let better = Kdf { m: 16, t: 2, p: 1 };
+        assert!(s.upgrade_kdf("pw-12345678", better).unwrap());
+        assert!(!s.upgrade_kdf("pw-12345678", better).unwrap(), "only once");
+        let b = fs::read(&p).unwrap();
+        let (k, _) = read_header(&b).unwrap();
+        assert_eq!((k.m, k.t), (16, 2));
+        assert_eq!(Session::open(&p, "pw-12345678").unwrap().data.items.len(), 1);
+        let mut s2 = Session::open(&p, "pw-12345678").unwrap();
+        assert!(s2.upgrade_kdf("pw-12345678", Kdf { m: 32, t: 2, p: 1 }).is_ok());
+        assert!(s2.upgrade_kdf("wrong", Kdf { m: 64, t: 2, p: 1 }).is_err());
+    }
+
+    #[test]
+    fn flags_are_cached_until_the_next_save() {
+        let p = tmp();
+        let mut s = Session::create(&p, "pw", FAST).unwrap();
+        let mut it = item("A");
+        it.fields = vec![Field { label: "Password".into(), value: "x".into(), kind: "secret".into() }];
+        s.upsert(it).unwrap();
+        let id = s.data.items[0].id.clone();
+        assert!(s.flags()[&id].contains(&"weak"));
+        s.data.items[0].fields[0].value = "Zt5@nW8*yB3%kD6^-long-and-random".into();
+        assert!(s.flags()[&id].contains(&"weak"), "cached");
+        s.save().unwrap();
+        assert!(!s.flags()[&id].contains(&"weak"), "recomputed after a save");
     }
 
     #[test]

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install front-end dependencies
+        run: npm ci
+
+      - name: Make the app icons (not in git)
+        run: npx tauri icon app-icon.png
+
+      - name: Type-check the UI
+        run: npx tsc --noEmit
+
+      - name: Front-end unit tests
+        run: npm test
+
+      - name: Rust unit tests
+        shell: bash
+        run: |
+          # tauri's build script wants the front-end folder to exist; the tests do not need a real build
+          mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html>' > dist/index.html
+          cd src-tauri && cargo test --lib
+
+      - name: Sync server tests
+        working-directory: server
+        run: python -m unittest -v test_server

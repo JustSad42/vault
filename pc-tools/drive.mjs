@@ -12,7 +12,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const WV = process.env.USERPROFILE + '\\vault-test-wv-' + Date.now(); // own WebView2 profile per run: flags must match for a shared one
 fs.readdirSync(process.env.USERPROFILE).filter(n => n.startsWith('vault-test-wv-')).forEach(n => { try { fs.rmSync(process.env.USERPROFILE + '\\' + n, { recursive: true, force: true }); } catch {} });
-const launch = () => spawn(EXE, [], { env: { ...process.env, VAULT_DIR: DATA, WEBVIEW2_USER_DATA_FOLDER: WV, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=9333 --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --use-file-for-fake-video-capture=' + BUILD + 'cam.mjpeg' }, stdio: 'ignore' });
+const launch = () => spawn(EXE, [], { env: { ...process.env, VAULT_DIR: DATA, VAULT_TEST_COPY: '1', WEBVIEW2_USER_DATA_FOLDER: WV, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=9333 --use-fake-device-for-media-stream --use-fake-ui-for-media-stream --use-file-for-fake-video-capture=' + BUILD + 'cam.mjpeg' }, stdio: 'ignore' });
 let app = launch();
 let ws, id = 0; const pend = new Map();
 async function connect() {
@@ -73,10 +73,17 @@ try {
 
   // history
   const gh = (await inv('list')).find(x => x.title === 'GitHub');
-  let it = await inv('get_item', { id: gh.id });
+  let it = await inv('get_item_full', { id: gh.id });
   it.fields.find(f => f.label === 'Password').value = 'NewPass!2345xyz'; await inv('save_item', { item: it });
-  it = await inv('get_item', { id: gh.id });
+  it = await inv('get_item_full', { id: gh.id });
   ok(it.history.length === 1 && it.history[0].value === generated, 'changing a password keeps the old one in history');
+  // the page only gets markers for secrets, and asks Rust for one value at a time
+  const view = await inv('get_item', { id: gh.id });
+  const pwIdx = view.fields.findIndex(f => f.label === 'Password');
+  ok(view.fields[pwIdx].value.startsWith('\u0001hidden:') && view.fields.find(f => f.kind === 'totp').value.startsWith('\u0001hidden:') && view.history[0].value.startsWith('\u0001hidden:')
+    && !JSON.stringify(view).includes('NewPass') && !JSON.stringify(view).includes(generated), 'get_item hides passwords, codes and earlier passwords from the page');
+  ok(await inv('reveal', { id: gh.id, src: 'field', at: 0, idx: pwIdx }) === 'NewPass!2345xyz' && await inv('reveal', { id: gh.id, src: 'hist', at: 0, idx: 0 }) === generated, 'reveal gives one value on request');
+  ok((view.fields.find(f => f.label === 'Username').value) === 'octocat', 'plain text fields stay visible');
 
   // csv import + dedupe, card, wifi + QR
   const n = await inv('import_csv', { text: 'name,url,username,password,note\nBank,https://bank.example,me,pw-1,\nBank,https://bank.example,me,pw-1,\n' });
@@ -86,6 +93,7 @@ try {
   await ev(`(()=>{const e=document.querySelectorAll('.erow')[1].querySelectorAll('input')[1];e.value='4111 1111 1111 1234';e.dispatchEvent(new Event('input',{bubbles:true}))})()`);
   await click('Save', 'form.edit button'); await wait(`document.querySelector('.list').innerText.includes('•••• 1234')`, 'card masked in list');
   await wait(`!!document.querySelector('.wallet')`, 'wallet card'); ok(true, 'card saved, masked in list, wallet graphic shown'); await sleep(500); await shot('08-card');
+  ok((await ev(`document.querySelector('.wallet .num').textContent`)).endsWith('1234'), 'wallet card shows the last four digits without the page holding the number');
   const F = (label, kind, value) => ({ label, kind, value });
   await inv('save_item', { item: { id: '', kind: 'wifi', title: 'Home Wi-Fi', folder: 'Home', fields: [F('Network name', 'text', 'HomeNet'), F('Password', 'secret', 'sup3r secret;pass'), F('Security', 'text', 'WPA2')], notes: '', favorite: true, updated: 0, history: [], deleted: 0 } });
   await inv('save_item', { item: { id: '', kind: 'login', title: 'TestSite', folder: '', fields: [F('Username', 'text', 'bob@test.org'), F('Password', 'secret', 'Zt5@nW8*yB3%kD6^')], notes: '', favorite: false, updated: 0, history: [], deleted: 0 } });
@@ -111,7 +119,7 @@ try {
   await click('Add 2 accounts', 'dialog button'); await wait(`!document.querySelector('dialog.twofa')`, 'dialog closed after add');
   const all = await inv('list');
   ok(all.filter(x => x.title === 'TestSite').length === 1 && all.filter(x => x.title === 'Example').length === 1, 'merge added no duplicate login, new login created');
-  const ts = await inv('get_item', { id: all.find(x => x.title === 'TestSite').id });
+  const ts = await inv('get_item_full', { id: all.find(x => x.title === 'TestSite').id });
   ok(ts.fields.some(f => f.kind === 'totp' && f.value.startsWith('otpauth://')), 'one-time code attached to the existing login');
   await sleep(1500); await shot('13-authenticator');
   ok((await ev(`document.querySelectorAll('.acard').length`)) >= 3, 'Authenticator view lists all codes');
@@ -124,7 +132,8 @@ try {
   if (camOk) { await sleep(400); await shot('13c-camera-found'); await click('Add 13 accounts', 'dialog button'); await wait(`!document.querySelector('dialog.twofa')`, 'camera import done'); ok((await inv('list')).some(x => x.title === 'Acct7') && (await inv('list')).some(x => x.title === 'Extra3'), 'camera-scanned accounts were added'); }
   else { await ev(`document.querySelector('dialog.twofa')?.remove()`); }
 
-  // scan the real screen: show a QR in an Edge window of its own, then scan
+  // scan the real screen: show a QR in an Edge window of its own, then scan (VAULT_SKIP_SCREEN=1 skips it while someone uses the PC)
+  if (!process.env.VAULT_SKIP_SCREEN) {
   const ps = `Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $f=New-Object Windows.Forms.Form; $f.Text='qrtest'; $f.StartPosition='Manual'; $f.Location=New-Object Drawing.Point(120,120); $f.Size=New-Object Drawing.Size(720,760); $f.TopMost=$true; $p=New-Object Windows.Forms.PictureBox; $p.Dock='Fill'; $p.SizeMode='Zoom'; $p.BackColor=[Drawing.Color]::White; $p.Image=[Drawing.Image]::FromFile('${BUILD}otp.png'); $f.Controls.Add($p); $f.ShowDialog() | Out-Null`;
   const edge = spawn('powershell', ['-NoProfile', '-Command', ps], { stdio: 'ignore' }); // a small form of our own showing the QR
   await sleep(4000);
@@ -136,6 +145,7 @@ try {
   spawn('taskkill', ['/pid', String(edge.pid), '/T', '/F'], { stdio: 'ignore' }); await sleep(1500);
   await ev('document.hasFocus()'); await shot('14-after-scan');
   try { await inv('scan_screen'); ok(false, 'scan_screen with no QR should fail'); } catch (e) { ok(/No QR code found/.test(e.message), 'scan_screen without a QR gives a clear error'); }
+  } else log('SKIP screen scan (VAULT_SKIP_SCREEN)');
   const p3 = await inv('scan_image', { data: fs.readFileSync(BUILD + 'otp.png').toString('base64') });
   ok(p3.accounts[0]?.title === 'ScreenSite', 'scan_image reads a site setup QR');
 
@@ -241,6 +251,38 @@ try {
     await inv('sync_disable'); await get('/v1/all', 'DELETE');
     ok(JSON.parse((await get('/v1/info')).b.toString()).rev === 0, 'test slot removed from the server');
   } else log('SKIP sync (set VAULT_SYNC_URL to test against your server)');
+
+  // ---- review features: hidden secrets in the UI, passphrases, imports, version reveal, auto-type picker, purge records
+  await nav('All items'); await clickRow('GitHub'); await wait(`document.querySelector('.detail .head h2')?.textContent==='GitHub'`, 'GitHub open');
+  const pwRow = `[...document.querySelectorAll('.detail .f')].find(r=>r.querySelector('.l')?.textContent==='Password')`;
+  ok((await ev(`${pwRow}.querySelector('.val').textContent`)) === '••••••••••', 'password row is masked');
+  ok(!(await ev(`[...document.querySelectorAll('.detail .chipbtn')].some(b=>b.offsetParent!==null)`)), 'no JWT button on fields that hold no JWT');
+  await ev(`${pwRow}.querySelector('button[title="Show or hide"]').click()`);
+  await wait(`${pwRow}.querySelector('.val').textContent==='NewPass!2345xyz'`, 'password shown via reveal'); ok(true, 'the eye button fetches the password from Rust'); await shot('30-revealed');
+  await ev(`[...document.querySelectorAll('.detail .head button')].find(b=>b.title?.includes('favorites')).click()`); await sleep(800);
+  const fav = await inv('get_item_full', { id: gh.id });
+  ok(fav.favorite && fav.fields.find(f => f.label === 'Password').value === 'NewPass!2345xyz' && fav.fields.find(f => f.kind === 'totp').value.startsWith('GEZD'), 'a favorite toggle from the view keeps the real secrets');
+  await wait(`document.querySelector('.detail .head h2')?.textContent==='GitHub'`, 'GitHub open again');
+  await ev(`[...document.querySelectorAll('.detail .head button')].find(b=>b.title?.startsWith('Version history')).click()`); await wait(`!!document.querySelector('dialog .vlist')`, 'version history');
+  await ev(`document.querySelector('dialog .vdiff button').click()`); await wait(`document.querySelector('dialog .vlist').innerText.includes('NewPass!2345xyz')`, 'version diff revealed');
+  ok((await ev(`document.querySelector('dialog .vlist').innerText`)).includes(generated), 'version history shows both passwords after the eye click'); await shot('31-versions'); await ev(`document.querySelector('dialog').remove()`);
+  // passphrase generator
+  await click('Generator', 'aside button'); await wait(`!!document.querySelector('dialog .seg')`, 'generator');
+  await click('Passphrase', 'dialog .seg button'); await wait(`/^[A-Z][a-z]+\\d?(-[A-Z][a-z]+\\d?){4}$/.test(document.querySelector('dialog input.mono').value)`, 'passphrase of 5 words');
+  ok(true, 'passphrase mode: ' + (await ev(`document.querySelector('dialog input.mono').value`)).replace(/[a-z]/g, '·')); await shot('32-passphrase'); await ev(`document.querySelector('dialog').remove()`);
+  // import dialog and Bitwarden JSON
+  await click('Import', 'aside button'); await wait(`document.querySelectorAll('dialog.importd .tile').length===3`, 'import dialog'); ok(await ev(`getComputedStyle(document.querySelector('dialog.importd .setcol')).display==='none'`), 'import dialog offers KeePass, Bitwarden and CSV; the KeePass password box waits for a file'); await shot('33-import'); await ev(`document.querySelector('dialog').remove()`);
+  const bwj = JSON.stringify({ encrypted: false, folders: [{ id: 'f', name: 'Imported' }], items: [{ type: 3, name: 'BW Card', folderId: 'f', card: { cardholderName: 'Me', number: '5555444433331111', expMonth: '1', expYear: '2030', code: '999' } }, { type: 4, name: 'BW Me', identity: { firstName: 'Bo', lastName: 'Wu', email: 'bo@x' } }] });
+  ok(await inv('import_bitwarden', { text: bwj }) === 2 && (await inv('list')).find(x => x.title === 'BW Card')?.tail === '1111', 'Bitwarden JSON import brings cards and identities');
+  // auto-type picker (the hotkey itself is not registered in a test copy): picking without a target window fails safely
+  await inv('plugin:event|emit', { event: 'autotype-pick', payload: { title: 'Sign in - GitHub', items: [{ id: gh.id, title: 'GitHub', username: 'octocat' }], locked: false } });
+  await wait(`!!document.querySelector('dialog.autotype')`, 'auto-type picker'); await shot('34-autotype');
+  ok((await ev(`document.querySelector('dialog.autotype').innerText`)).includes('Sign in - GitHub'), 'auto-type picker lists the matching login');
+  await ev(`document.querySelector('dialog.autotype .row').click()`); await wait(`document.querySelector('#toast')?.innerText.includes('Ctrl+Alt+A')`, 'no target window'); ok(true, 'picking with no target window types nothing and says why');
+  // emptying the trash leaves a purge record (so sync merges do not resurrect)
+  const tmpId = await inv('save_item', { item: mk('note', 'Throwaway', [], { notes: 'x' }) });
+  await inv('delete_item', { id: tmpId }); await inv('empty_trash');
+  ok(!(await inv('list')).some(x => x.id === tmpId), 'emptied trash item is gone');
 
   // stay signed in: the vault was created with the option on, so a restart opens straight into it
   ok(fs.existsSync(DATA + '\\quick.bin'), 'quick.bin written when the option is on');

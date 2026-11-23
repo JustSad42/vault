@@ -1,8 +1,5 @@
 //! Website matching: which saved logins belong to a page, and when a page only looks like a saved site.
 
-const TWO_LEVEL: &[&str] = &["co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "com.au", "net.au", "org.au", "co.nz", "co.jp", "ne.jp", "or.jp", "co.in", "co.kr", "co.za",
-    "com.br", "com.mx", "com.ar", "com.tr", "com.sg", "com.hk", "com.tw", "com.cn", "com.my", "com.ph", "com.eg", "com.sa", "com.pk", "co.id", "co.il", "com.ua", "com.pl"];
-
 /// "https://User@Sub.Example.com:8080/x?y" or "example.com/x" -> "sub.example.com".
 pub fn host_of(url: &str) -> Option<String> {
     let u = url.trim();
@@ -15,13 +12,12 @@ pub fn host_of(url: &str) -> Option<String> {
 
 fn is_ip(h: &str) -> bool { h.split('.').count() == 4 && h.split('.').all(|p| p.parse::<u8>().is_ok()) }
 
-/// Registrable domain ("login.paypal.co.uk" -> "paypal.co.uk"). A small built-in suffix list, not the full public suffix list.
+/// Registrable domain from the full public suffix list (built in): "login.paypal.co.uk" -> "paypal.co.uk", and
+/// "alice.github.io" -> "alice.github.io", because github.io is a public suffix: alice and mallory are different sites.
+/// A host that is itself a public suffix, an IP address or a single label ("localhost") stays as it is.
 pub fn etld1(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() <= 2 || is_ip(host) { return host.to_string(); }
-    let two = labels[labels.len() - 2..].join(".");
-    let n = if TWO_LEVEL.contains(&two.as_str()) { 3 } else { 2 };
-    labels[labels.len().saturating_sub(n)..].join(".")
+    if is_ip(host) { return host.to_string(); }
+    psl::domain_str(host).unwrap_or(host).to_string()
 }
 
 pub fn same_site(a: &str, b: &str) -> bool {
@@ -76,6 +72,14 @@ mod tests {
         assert_eq!(etld1("192.168.1.10"), "192.168.1.10");
         assert!(same_site("https://accounts.google.com/x", "http://mail.google.com"));
         assert!(!same_site("https://google.com", "https://google.org"));
+        // shared hosting: every subdomain belongs to someone else
+        assert!(!same_site("https://alice.github.io", "https://mallory.github.io"));
+        assert!(!same_site("https://a.herokuapp.com", "https://b.herokuapp.com"));
+        assert!(!same_site("https://x.blogspot.com", "https://y.blogspot.com"));
+        assert!(same_site("https://alice.github.io/repo", "https://www.alice.github.io"));
+        assert_eq!(etld1("shop.example.com.au"), "example.com.au");
+        assert_eq!(etld1("localhost"), "localhost");
+        assert_eq!(etld1("github.io"), "github.io");
     }
 
     #[test]

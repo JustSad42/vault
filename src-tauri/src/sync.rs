@@ -19,6 +19,7 @@ pub trait Remote {
     fn list_att(&self) -> Result<Vec<String>, String>;
     fn get_att(&self, id: &str) -> Result<Option<Vec<u8>>, String>;
     fn put_att(&self, id: &str, data: &[u8]) -> Result<(), String>;
+    fn del_att(&self, id: &str) -> Result<(), String>;
 }
 
 /// `size` and `mtime` (ns) describe vault.bin when its hash was last confirmed equal to `hash`; 0 = unknown.
@@ -113,12 +114,14 @@ fn push_recovery(dir: &Path, remote: &dyn Remote) -> Result<(), String> {
     match fs::read(dir.join("recovery.bin")) { Ok(b) => remote.put_recovery(&b), Err(_) => Ok(()) }
 }
 
-/// Uploads attachment files the server lacks and downloads the ones this PC lacks.
+/// Uploads attachment files the server lacks, downloads the ones this PC lacks, and deletes server files that the
+/// vault no longer refers to. Only called right after this PC's vault became the server's current one (push, merge or
+/// adopt), so "not referenced" means deleted everywhere, not "added on another PC that we have not seen yet".
 fn attachments(dir: &Path, remote: &dyn Remote, key: &[u8; 32]) -> Result<(), String> {
     let data = vault::read_data(&fs::read(dir.join("vault.bin")).map_err(|e| e.to_string())?, key)?;
     let want: Vec<&str> = data.items.iter().flat_map(|i| i.attachments.iter().map(|a| a.id.as_str())).collect();
-    if want.is_empty() { return Ok(()); }
     let have = remote.list_att()?;
+    for gone in have.iter().filter(|h| !want.contains(&h.as_str())) { remote.del_att(gone)?; }
     let adir = dir.join("attachments");
     for id in want {
         let f = adir.join(format!("{id}.bin"));
@@ -201,6 +204,7 @@ impl Remote for HttpRemote {
     }
     fn get_att(&self, id: &str) -> Result<Option<Vec<u8>>, String> { self.call("GET", &format!("/v1/att/{id}"), None) }
     fn put_att(&self, id: &str, data: &[u8]) -> Result<(), String> { self.call("PUT", &format!("/v1/att/{id}"), Some(data)).map(|_| ()) }
+    fn del_att(&self, id: &str) -> Result<(), String> { self.call("DELETE", &format!("/v1/att/{id}"), None).map(|_| ()) }
 }
 
 #[cfg(test)]
@@ -227,6 +231,7 @@ mod tests {
         fn list_att(&self) -> Result<Vec<String>, String> { Ok(self.atts.borrow().keys().cloned().collect()) }
         fn get_att(&self, id: &str) -> Result<Option<Vec<u8>>, String> { Ok(self.atts.borrow().get(id).cloned()) }
         fn put_att(&self, id: &str, d: &[u8]) -> Result<(), String> { self.atts.borrow_mut().insert(id.into(), d.to_vec()); Ok(()) }
+        fn del_att(&self, id: &str) -> Result<(), String> { self.atts.borrow_mut().remove(id); Ok(()) }
     }
 
     fn dir() -> std::path::PathBuf { std::env::temp_dir().join(format!("vault-sync-{}", vault::now() as u128 * 1000 + rand_id())) }
@@ -279,6 +284,13 @@ mod tests {
         assert_eq!(b.att_get(&att).unwrap(), b"PDF-BYTES");
         assert!(db.join("recovery.bin").exists());
         assert!(!srv.vault.borrow().as_ref().unwrap().0.windows(9).any(|w| w == b"PDF-BYTES"), "only encrypted data goes to the server");
+        // removing the attachment removes it from the server too
+        assert_eq!(srv.atts.borrow().len(), 1);
+        b.att_remove(&one, &att).unwrap();
+        assert_eq!(round(&db, &srv, &mut b, "pw-one-two"), Outcome::Pushed);
+        assert!(srv.atts.borrow().is_empty(), "server copy deleted");
+        assert_eq!(round(&da, &srv, &mut a, "pw-one-two"), Outcome::Pulled);
+        assert!(a.data.items.iter().all(|i| i.attachments.is_empty()));
     }
 
     #[test]

@@ -39,6 +39,21 @@ pub fn password(len: usize, lower: bool, upper: bool, digits: bool, symbols: boo
     Ok(String::from_utf8(out).unwrap())
 }
 
+/// A passphrase of random words from the EFF large list (7776 words, about 12.9 bits each). `number` adds one random
+/// digit to one random word, for sites that insist on a digit.
+pub fn passphrase(words: usize, sep: &str, capitalize: bool, number: bool) -> Result<String, String> {
+    if !(3..=12).contains(&words) { return Err("use 3 to 12 words".into()); }
+    if sep.chars().count() > 3 || sep.chars().any(|c| c.is_alphanumeric()) { return Err("the separator is up to 3 symbols or spaces".into()); }
+    let list = eff_wordlist::large::LIST;
+    let mut out: Vec<String> = (0..words).map(|_| {
+        // four words ("t-shirt", "yo-yo"...) contain a hyphen, which would blur the word boundaries: draw again
+        let w = loop { let w = list[below(list.len())].1; if !w.contains('-') { break w; } };
+        if capitalize { let mut c = w.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() } else { w.to_string() }
+    }).collect();
+    if number { let i = below(words); out[i].push(char::from(b'0' + below(10) as u8)); }
+    Ok(out.join(sep))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +75,19 @@ mod tests {
         assert_eq!(level(bits("aaaaaaaaaaaa")), "weak");
         assert!(bits("abcdefgh") < bits("aB3$eF6&hJ9("));
         assert_eq!(level(bits(&password(20, true, true, true, true).unwrap())), "strong");
+    }
+
+    #[test]
+    fn passphrases() {
+        let p = passphrase(5, "-", true, true).unwrap();
+        let parts: Vec<&str> = p.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert!(parts.iter().all(|w| w.chars().next().unwrap().is_uppercase()));
+        assert_eq!(p.chars().filter(|c| c.is_ascii_digit()).count(), 1);
+        assert_ne!(passphrase(6, " ", false, false).unwrap(), passphrase(6, " ", false, false).unwrap());
+        assert_eq!(eff_wordlist::large::LIST.len(), 7776);
+        assert!(passphrase(2, "-", false, false).is_err() && passphrase(5, "abc", false, false).is_err());
+        assert_eq!(level(bits(&passphrase(5, "-", false, false).unwrap())), "strong");
     }
 
     #[test]

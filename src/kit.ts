@@ -12,7 +12,7 @@ export interface Item {
 }
 export interface Sum {
   updated: number; id: string; kind: Kind; title: string; sub: string; folder: string; favorite: boolean; deleted: boolean; tags: string[]; expires: string; files: number;
-  category: string; domain: string; flags: string[]; versions: number;
+  category: string; domain: string; flags: string[]; versions: number; tail: string;
 }
 export interface Template { name: string; kind: string; fields: { label: string; kind: string }[] }
 export interface Settings {
@@ -24,6 +24,13 @@ export interface Acct { title: string; account: string; uri: string }
 export interface Batch { id: number; index: number; size: number }
 export interface Parsed { accounts: Acct[]; skipped: number; batches: Batch[]; foreign: boolean }
 export interface Live { id: string; title: string; sub: string; label: string; code: string; left: number; period: number }
+
+/** `get_item` hands the page markers instead of secret values; Rust gives out one value at a time (`reveal`). */
+export const HIDDEN = '\u0001hidden:';
+export const isHidden = (v: string) => v.startsWith(HIDDEN);
+/** Where Rust finds one secret: a field, an earlier password (`hist`), or a field of an old version (`at`). */
+export interface SecretRef { id: string; src: 'field' | 'hist' | 'version'; at: number; idx: number }
+export const fieldRef = (id: string, idx: number): SecretRef => ({ id, src: 'field', at: 0, idx });
 
 export const KINDS: Record<Kind, { label: string; plural: string; icon: string; desc: string; color: string }> = {
   login: { label: 'Login', plural: 'Logins', icon: 'key', desc: 'Website or app account', color: '#6c8cff' },
@@ -132,8 +139,14 @@ export function toast(msg: string, bad = false) {
   toastTimer = window.setTimeout(() => t!.classList.remove('show'), bad ? 6000 : 2600);
 }
 
+const copied = () => toast(S.settings.clip_secs ? `Copied. The clipboard clears in ${S.settings.clip_secs} s.` : 'Copied.');
 export async function copyText(text: string) {
-  try { await call('copy', { text }); toast(S.settings.clip_secs ? `Copied. The clipboard clears in ${S.settings.clip_secs} s.` : 'Copied.'); } catch (e) { err(e); }
+  try { await call('copy', { text }); copied(); } catch (e) { err(e); }
+}
+export const reveal = (r: SecretRef) => call<string>('reveal', { ...r });
+/** Copies a secret straight from Rust; `fmt` wraps it, `{v}` standing for the value. */
+export async function revealCopy(r: SecretRef, fmt?: string) {
+  try { await call('reveal_copy', { ...r, fmt: fmt ?? null }); copied(); } catch (e) { err(e); }
 }
 
 export const hue = (s: string) => { let n = 0; for (const c of s) n = (n * 31 + c.codePointAt(0)!) % 360; return n; };
@@ -160,8 +173,8 @@ export function iconBtn(name: string, title: string, onclick: (e: Event) => void
   return h('button', { type: 'button', class: 'icon ' + cls, title, 'aria-label': title, onclick }, icon(name));
 }
 export function flashIcon(b: HTMLElement, back = 'copy') { b.replaceChildren(icon('check')); b.classList.add('done'); setTimeout(() => { b.replaceChildren(icon(back)); b.classList.remove('done'); }, 1200); }
-export function copyBtn(get: () => string) {
-  const b = iconBtn('copy', 'Copy', () => { copyText(get()); flashIcon(b); });
+export function copyBtn(get: () => string | void, copy?: () => void) {
+  const b = iconBtn('copy', 'Copy', () => { if (copy) copy(); else { const v = get(); if (v) copyText(v); } flashIcon(b); });
   return b;
 }
 
