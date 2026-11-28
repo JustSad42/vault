@@ -13,7 +13,7 @@ import { Block, Inl, parse as parseMd, toggleLine } from './md';
 void masterDialog;
 const app = document.getElementById('app')!;
 let ticks: number[] = [];
-let idleTimer = 0;
+let lastTouch = 0;
 let searchTimer = 0;
 let layoutEl: HTMLElement, listEl: HTMLElement, detailEl: HTMLElement, navEl: HTMLElement, searchEl: HTMLInputElement, bulkEl: HTMLElement;
 let sortBy = 'name';
@@ -26,7 +26,6 @@ const SMART: [string, string, string][] = [['flag:weak', 'Weak passwords', 'aler
 // ---------- lock screen ----------
 async function showLock(auto = false) {
   S.mainActive = false;
-  clearTimeout(idleTimer);
   ticks.forEach(clearInterval); ticks = [];
   S.sums = []; S.vis = []; S.sel = null; S.editing = null; S.filter = 'all'; S.query = ''; S.qids = null; S.bulk = false; S.picked.clear(); S.pending = [];
   document.querySelectorAll('dialog').forEach(d => d.remove());
@@ -68,9 +67,11 @@ async function showLock(auto = false) {
 }
 
 // ---------- main screen ----------
+// The idle lock runs in Rust (a page timer would stop while the window sleeps in the tray); the page reports activity.
 function resetIdle() {
-  clearTimeout(idleTimer);
-  if (S.settings.autolock_min > 0) idleTimer = window.setTimeout(lockNow, S.settings.autolock_min * 60000);
+  if (Date.now() - lastTouch < 2000) return;
+  lastTouch = Date.now();
+  call('touch').catch(() => {});
 }
 async function lockNow() { await call('lock'); await showLock(false); }
 

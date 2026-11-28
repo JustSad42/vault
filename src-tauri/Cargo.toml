@@ -40,6 +40,9 @@ eff-wordlist = "1.0"
 keepass = "0.17"
 
 [target.'cfg(windows)'.dependencies]
+# the versions Tauri uses: put a hidden window's web view to sleep
+webview2-com = "0.39"
+windows-core = "0.62"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_StationsAndDesktops", "Win32_System_RemoteDesktop", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 windows = { version = "0.62", features = ["Security_Credentials_UI", "Foundation", "Win32_Foundation", "Win32_System_WinRT"] }
 windows-future = "0.3"

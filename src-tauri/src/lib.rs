@@ -1,3 +1,4 @@
+mod sleep;
 mod audit;
 mod autotype;
 mod bridge;
@@ -32,6 +33,7 @@ struct App(Mutex<Option<Session>>);
 static TRAY: AtomicBool = AtomicBool::new(false);
 static LOCK_ON_WINDOWS_LOCK: AtomicBool = AtomicBool::new(true);
 static SYNCING: AtomicBool = AtomicBool::new(false);
+static MISSED_SYNC: AtomicBool = AtomicBool::new(false);
 static SYNC_NOTE: Mutex<(u64, bool, String)> = Mutex::new((0, true, String::new()));
 
 fn prefs_path() -> PathBuf { vault_dir().join("prefs.json") }
@@ -78,6 +80,20 @@ fn vault_dir() -> PathBuf {
 fn vault_path() -> PathBuf { vault_dir().join("vault.bin") }
 fn quick_path() -> PathBuf { vault_dir().join("quick.bin") }
 
+/// When the user last did something in an unlocked vault. The idle lock runs here: a timer in the
+/// page would stop while the window sleeps in the tray.
+static LAST_ACTIVITY: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+#[tauri::command]
+fn touch() { *LAST_ACTIVITY.lock().unwrap() = Some(std::time::Instant::now()); }
+
+fn unlocked(st: &St, s: Session) {
+    touch();
+    *st.0.lock().unwrap() = Some(s);
+}
+
+fn idle_expired(minutes: u32, idle: Duration) -> bool { minutes > 0 && idle >= Duration::from_secs(u64::from(minutes) * 60) }
+
 fn with<T>(st: &St, f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
     f(st.0.lock().unwrap().as_mut().ok_or("vault is locked")?)
 }
@@ -109,7 +125,7 @@ fn status(st: St) -> Status {
 async fn create_vault(st: St<'_>, password: String) -> Result<(), String> {
     check_master(&password)?;
     let s = Session::create(&vault_path(), &password, KDF)?;
-    *st.0.lock().unwrap() = Some(s);
+    unlocked(&st, s);
     Ok(())
 }
 
@@ -118,7 +134,7 @@ async fn unlock(st: St<'_>, password: String) -> Result<(), String> {
     let mut s = Session::open(&vault_path(), &password)?;
     // a vault made with a cheaper key derivation is re-encrypted with today's; not being able to is no reason to stay locked
     if let Ok(true) = s.upgrade_kdf(&password, KDF) { if quick_path().exists() { let _ = quick_write(&s, quick_hello_on()); } }
-    *st.0.lock().unwrap() = Some(s);
+    unlocked(&st, s);
     Ok(())
 }
 
@@ -171,7 +187,7 @@ async fn quick_unlock(app: tauri::AppHandle, st: St<'_>) -> Result<(), String> {
     let key = zeroize::Zeroizing::new(quick::open(&blob)?);
     let key: [u8; 32] = key[..].try_into().map_err(|_| "saved key is damaged".to_string())?;
     let s = Session::open_with_key(&vault_path(), &key)?;
-    *st.0.lock().unwrap() = Some(s);
+    unlocked(&st, s);
     Ok(())
 }
 
@@ -439,7 +455,7 @@ async fn recover_vault(st: St<'_>, phrase: String, new_password: String) -> Resu
     check_master(&new_password)?;
     let s = Session::recover(&vault_path(), &phrase, &new_password, KDF)?;
     if quick_path().exists() { quick_write(&s, quick_hello_on())?; }
-    *st.0.lock().unwrap() = Some(s);
+    unlocked(&st, s);
     Ok(())
 }
 
@@ -618,7 +634,7 @@ fn sync_run(app: &tauri::AppHandle) -> Result<sync::Outcome, String> {
             sync::apply(&dir, &plan)?;
             match Session::open_with_key(&vault_path(), &key) {
                 Ok(s) => *g = Some(s),
-                Err(_) => { *g = None; drop(g); let _ = app.emit("vault-locked", ()); } // the master password was changed on another PC
+                Err(_) => { *g = None; drop(g); lock_now(app); } // the master password was changed on another PC
             }
         }
         match sync::finish(&dir, &remote, &plan, &key)? { sync::Outcome::Retry => continue, o => return Ok(o) }
@@ -631,7 +647,11 @@ fn sync_guarded(app: &tauri::AppHandle) -> Result<sync::Outcome, String> {
     let r = sync_run(app);
     SYNCING.store(false, Ordering::SeqCst);
     *SYNC_NOTE.lock().unwrap() = (vault::now(), r.is_ok(), match &r { Ok(o) => format!("{o:?}"), Err(e) => e.clone() });
-    if matches!(r, Ok(sync::Outcome::Pulled) | Ok(sync::Outcome::Merged)) { let _ = app.emit("vault-synced", ()); }
+    if matches!(r, Ok(sync::Outcome::Pulled) | Ok(sync::Outcome::Merged)) {
+        // a hidden window is told when it comes back
+        if app.get_webview_window("main").is_some_and(|w| !w.is_visible().unwrap_or(true)) { MISSED_SYNC.store(true, Ordering::SeqCst); }
+        else { let _ = app.emit("vault-synced", ()); }
+    }
     r
 }
 
@@ -727,11 +747,16 @@ fn autostart_set(on: bool) -> Result<(), String> {
 fn lock_now(app: &tauri::AppHandle) {
     if let Some(st) = app.try_state::<App>() { *st.0.lock().unwrap() = None; }
     clear_open_dir();
+    // A sleeping page would miss this and still show the vault when it wakes: wake it to tell it.
+    let hidden = app.get_webview_window("main").filter(|w| !w.is_visible().unwrap_or(true));
+    if let Some(w) = &hidden { sleep::wake(w); }
     let _ = app.emit("vault-locked", ());
+    if let Some(w) = &hidden { sleep::later(w, Duration::from_secs(5)); }
 }
 
 fn show(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") { let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus(); }
+    if let Some(w) = app.get_webview_window("main") { sleep::wake(&w); let _ = w.unminimize(); let _ = w.show(); let _ = w.set_focus(); }
+    if MISSED_SYNC.swap(false, Ordering::SeqCst) { let _ = app.emit("vault-synced", ()); }
 }
 
 /// `VAULT_TEST_COPY=1` (with its own `VAULT_DIR`): an end-to-end test copy that can run next to the real Vault. It
@@ -752,8 +777,15 @@ pub fn run() {
         }).build())
         .manage(App(Mutex::new(None)))
         .on_window_event(|w, ev| {
+            if let tauri::WindowEvent::Focused(true) = ev {
+                if let Some(w) = w.app_handle().get_webview_window(w.label()) { sleep::focused(&w); }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
-                if TRAY.load(Ordering::Relaxed) { api.prevent_close(); let _ = w.hide(); }
+                if TRAY.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    let _ = w.hide();
+                    if let Some(w) = w.app_handle().get_webview_window(w.label()) { sleep::later(&w, Duration::from_secs(5)); }
+                }
             }
         })
         .setup(|app| {
@@ -799,12 +831,36 @@ pub fn run() {
                     }
                 });
             }
-            if std::env::args().any(|a| a == "--minimized") { if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); } }
+            if std::env::args().any(|a| a == "--minimized") {
+                // later than usual: the page first loads and may sign in by itself
+                if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); sleep::later(&w, Duration::from_secs(30)); }
+            }
+            // lock after the chosen idle time
+            let hi = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let idle = LAST_ACTIVITY.lock().unwrap().map(|t| t.elapsed());
+                let due = idle.is_some_and(|idle| hi.try_state::<App>().is_some_and(|st| st.0.lock().unwrap().as_ref().is_some_and(|s| idle_expired(s.data.settings.autolock_min, idle))));
+                if due { lock_now(&hi); }
+            });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_item_full, reveal, reveal_copy, field_totp, wifi_qr_item, generate_passphrase, import_bitwarden, import_keepass, hello_available, quick_hello_set, autotype_item, sync_status, sync_enable, sync_disable, sync_key, sync_now, sync_restore, bridge_pair_start, bridge_paired, bridge_revoke, extension_install, status, create_vault, unlock, quick_enable, quick_disable, quick_unlock, lock, list, get_item, save_item, delete_item, restore_item, empty_trash,
+        .invoke_handler(tauri::generate_handler![touch, get_item_full, reveal, reveal_copy, field_totp, wifi_qr_item, generate_passphrase, import_bitwarden, import_keepass, hello_available, quick_hello_set, autotype_item, sync_status, sync_enable, sync_disable, sync_key, sync_now, sync_restore, bridge_pair_start, bridge_paired, bridge_revoke, extension_install, status, create_vault, unlock, quick_enable, quick_disable, quick_unlock, lock, list, get_item, save_item, delete_item, restore_item, empty_trash,
             totp, totp_all, search, restore_version, categories_list, autostart_get, autostart_set, recovery_enable, recovery_phrase, recover_vault, att_add, att_data, att_open, att_save, att_remove, bulk, duplicate_item, list_backups, restore_backup, share_save, share_load, parse_2fa, scan_screen, scan_image, scan_luma, import_items, export_backup, generate, strength, security_audit, breach_check, wifi_qr, import_csv, change_password, get_settings, set_settings, backup_dir, open_backups, copy])
         .build(tauri::generate_context!())
         .expect("error while building Vault")
         .run(|_app, event| { if let tauri::RunEvent::Exit = event { clear_open_dir(); } });
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::idle_expired;
+    use std::time::Duration;
+
+    #[test]
+    fn locks_only_after_the_chosen_time() {
+        assert!(!idle_expired(0, Duration::from_secs(1_000_000))); // never
+        assert!(!idle_expired(5, Duration::from_secs(299)));
+        assert!(idle_expired(5, Duration::from_secs(300)));
+    }
 }
