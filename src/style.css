@@ -49,7 +49,8 @@ select { padding-right: 8px; } textarea { resize: vertical; width: 100%; }
 
 /* lock screen */
 .center { height: 100%; display: grid; place-items: center; position: relative; overflow: hidden; }
-.orb { position: absolute; width: 560px; height: 560px; border-radius: 50%; filter: blur(110px); opacity: .42; animation: drift 16s ease-in-out infinite; pointer-events: none; }
+.orb { position: absolute; width: 560px; height: 560px; border-radius: 50%; filter: blur(110px); opacity: .42; animation: drift 16s ease-in-out infinite; animation-play-state: paused; pointer-events: none; }
+.center.live .orb { animation-play-state: running; } /* drifting re-blurs every frame; main.ts only sets .live while the window is in use */
 .orb.a { background: var(--acc); top: -170px; left: -130px; } .orb.b { background: var(--acc2); bottom: -210px; right: -110px; animation-delay: -8s; } .orb.c { background: var(--ok); width: 320px; height: 320px; top: 40%; left: 55%; opacity: .16; animation-delay: -4s; }
 .card { background: color-mix(in srgb, var(--s1) 82%, transparent); backdrop-filter: blur(22px) saturate(1.4); border: 1px solid color-mix(in srgb, var(--line) 80%, var(--acc)); border-radius: 22px; padding: 34px 30px; box-shadow: var(--shadow); }
 .lock { width: 400px; max-width: 92vw; display: grid; gap: 12px; text-align: center; position: relative; animation: pop .45s var(--ease); }

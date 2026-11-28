@@ -64,7 +64,25 @@ async function showLock(auto = false) {
   });
   put(app, h('div', { class: 'center' }, h('i', { class: 'orb a' }), h('i', { class: 'orb b' }), h('i', { class: 'orb c' }), form));
   (quick ? btn : pw.input).focus();
+  if (document.hasFocus()) wakeOrbs();
 }
+
+// The lock-screen orbs cost ~12% of a core while they drift, and a locked vault can sit open all day.
+// Let them drift only while the window is focused and was used in the last 45 s; otherwise they freeze in place.
+let orbTimer = 0;
+function wakeOrbs() {
+  const c = document.querySelector('.center');
+  if (!c || !document.hasFocus()) return; // hovering an unfocused window shouldn't start them
+  c.classList.add('live');
+  clearTimeout(orbTimer);
+  orbTimer = window.setTimeout(sleepOrbs, 45000);
+}
+function sleepOrbs() { clearTimeout(orbTimer); document.querySelector('.center')?.classList.remove('live'); }
+window.addEventListener('focus', wakeOrbs);
+window.addEventListener('blur', sleepOrbs);
+window.addEventListener('pointermove', wakeOrbs, { passive: true });
+window.addEventListener('keydown', wakeOrbs);
+document.addEventListener('visibilitychange', () => (document.hidden ? sleepOrbs() : document.hasFocus() && wakeOrbs()));
 
 // ---------- main screen ----------
 // The idle lock runs in Rust (a page timer would stop while the window sleeps in the tray); the page reports activity.
